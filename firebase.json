@@ -1,0 +1,10 @@
+{
+  "hosting": {
+    "public": "checkin-scripts",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ]
+  }
+}
