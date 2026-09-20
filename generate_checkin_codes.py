@@ -33,14 +33,14 @@ def load_roster(csv_path):
             team = (row.get("team") or "").strip()
             if not name or not email:
                 raise ValueError(f"Row {i}: missing name or email")
-            if role not in ("participant", "judge"):
-                raise ValueError(f"Row {i}: role must be 'participant' or 'judge', got '{role}'")
+            if role not in ("participant", "judge", "mentor"):
+                raise ValueError(f"Row {i}: role must be 'participant', 'judge', or 'mentor', got '{role}'")
             rows.append({"name": name, "email": email, "role": role, "team": team})
     return rows
 
 
 def assign_ids(rows):
-    counters = {"participant": 0, "judge": 0}
+    counters = {"participant": 0, "judge": 0, "mentor": 0}
     seen_emails = set()
     for row in rows:
         if row["email"].lower() in seen_emails:
@@ -48,7 +48,7 @@ def assign_ids(rows):
         seen_emails.add(row["email"].lower())
 
         counters[row["role"]] += 1
-        prefix = "P" if row["role"] == "participant" else "J"
+        prefix = {"participant": "P", "judge": "J", "mentor": "M"}[row["role"]]
         row["id"] = f"{EVENT_CODE}-{prefix}{counters[row['role']]:03d}"
     return rows
 
@@ -70,8 +70,9 @@ def main():
 
     participants = sum(1 for r in rows if r["role"] == "participant")
     judges = sum(1 for r in rows if r["role"] == "judge")
+    mentors = sum(1 for r in rows if r["role"] == "mentor")
     print(f"Generated {len(rows)} QR codes -> {QR_DIR}/")
-    print(f"  {participants} participants, {judges} judges")
+    print(f"  {participants} participants, {judges} judges, {mentors} mentors")
     print(f"Wrote {OUTPUT_JSON} (used by the next two scripts)")
 
 

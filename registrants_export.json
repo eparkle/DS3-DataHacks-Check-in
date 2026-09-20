@@ -1,16 +1,30 @@
 [
   {
     "name": "Evan Park",
-    "email": "emp004@gmail.com",
+    "email": "emp004@ucsd.edu",
+    "role": "participant",
+    "team": "Team Nimbus",
+    "id": "DH26-P001"
+  },
+  {
+    "name": "Adrian Christian Hernandez",
+    "email": "evanpark.contact@gmail.com",
+    "role": "participant",
+    "team": "Team Nimbus",
+    "id": "DH26-P002"
+  },
+  {
+    "name": "Ansh Zaddy",
+    "email": "quilavin@gmail.com",
     "role": "judge",
     "team": "",
     "id": "DH26-J001"
   },
   {
-    "name": "Ansh Bhatnagar",
-    "email": "quilavin@gmail.com",
-    "role": "participant",
-    "team": "sonion",
-    "id": "DH26-P001"
+    "name": "Random Kid",
+    "email": "evanmateuspark@gmail.com",
+    "role": "mentor",
+    "team": "",
+    "id": "DH26-M001"
   }
 ]

@@ -15,7 +15,7 @@ import json
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-SERVICE_ACCOUNT_PATH = "datahacks-check-in-firebase-adminsdk-fbsvc-0de05fae2e.json"
+SERVICE_ACCOUNT_PATH = "serviceAccountKey.json"
 INPUT_JSON = "registrants_export.json"
 BATCH_SIZE = 450  # Firestore batched writes cap out at 500 operations
 
