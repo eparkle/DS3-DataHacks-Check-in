@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DataHacks Check-In</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+<div id="auth-screen">
+  <div class="auth-card">
+    <h1>DataHacks Check-In</h1>
+    <p class="lead">Sign in with an organizer account. Check-in is restricted to event staff.</p>
+    <form class="auth-form" id="login-form">
+      <input id="login-email" type="email" autocomplete="username" placeholder="Organizer email" required>
+      <input id="login-password" type="password" autocomplete="current-password" placeholder="Password" required>
+      <button class="primary" type="submit" id="login-btn">Sign in</button>
+      <div id="auth-error"></div>
+    </form>
+  </div>
+</div>
+
+<div id="boot-screen" class="app-hidden">
+  <div class="spinner"></div>
+  <div id="boot-message">Connecting to database…</div>
+</div>
+
+<div class="wrap app-hidden" id="app">
+
+  <header>
+    <div class="brand">
+      <h1>DataHacks Check-In</h1>
+      <span id="event-badge">—</span>
+    </div>
+    <div class="header-actions">
+      <span id="session-email"></span>
+      <button class="ghost" id="sign-out-btn" type="button">Sign out</button>
+      <nav>
+        <button class="tab-btn active" data-view="scan" type="button">Scan</button>
+        <button class="tab-btn" data-view="hacker" type="button">Hackers</button>
+        <button class="tab-btn" data-view="judge" type="button">Judges</button>
+        <button class="tab-btn" data-view="mentor" type="button">Mentors</button>
+      </nav>
+    </div>
+  </header>
+
+  <div class="view active" id="view-scan">
+    <div class="scan-grid">
+      <div class="panel">
+        <h2>Camera scanner</h2>
+        <div id="reader-frame">
+          <div id="reader"></div>
+          <div class="corners"><span class="tl"></span><span class="tr"></span><span class="bl"></span><span class="br"></span></div>
+        </div>
+        <div class="scan-controls">
+          <button class="primary" id="start-btn" type="button">Start camera</button>
+          <button class="ghost" id="stop-btn" type="button" disabled>Stop</button>
+        </div>
+        <div id="status-card">
+          <div class="placeholder">Waiting for first scan…</div>
+        </div>
+        <div class="manual">
+          <input id="manual-input" placeholder="Paste a user UUID or email, then press Enter">
+        </div>
+        <p class="note">QR codes should contain the attendee’s user UUID. Email also works if they’re already on the roster.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="view" id="view-hacker" data-role="hacker"></div>
+  <div class="view" id="view-judge" data-role="judge"></div>
+  <div class="view" id="view-mentor" data-role="mentor"></div>
+
+</div>
+
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>

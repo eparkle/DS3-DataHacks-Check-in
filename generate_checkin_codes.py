@@ -1,79 +1,65 @@
 """
-Step 1 of 3: Generate unique check-in IDs + QR code images from your roster.
+Generate QR images whose payload is each attendee’s Supabase user UUID.
 
-Input:  roster.csv          (columns: name,email,role,team)
-Output: qr_codes/*.png       (one QR image per person, filename = their ID)
-        registrants_export.json  (feeds into import_to_firestore.py and send_emails.py)
+The desk scanner and check_in_attendee() both expect that UUID.
 
 Usage:
-    pip install qrcode[pil]
+    pip install -r requirements.txt
     python generate_checkin_codes.py
+    python generate_checkin_codes.py --event-id 96f5c446-76df-4001-948c-67c01a56ebcf
 """
 
-import csv
-import json
+from __future__ import annotations
+
+import argparse
+import re
 from pathlib import Path
 
 import qrcode
 
-CSV_PATH = "roster.csv"
+from supabase_roster import load_roster
+
 QR_DIR = Path("qr_codes")
-OUTPUT_JSON = "registrants_export.json"
-EVENT_CODE = "DH26"  # short prefix so IDs read as e.g. DH26-P001, DH26-J001
 
 
-def load_roster(csv_path):
-    rows = []
-    with open(csv_path, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for i, row in enumerate(reader, start=2):  # start=2: row 1 is the header
-            name = (row.get("name") or "").strip()
-            email = (row.get("email") or "").strip()
-            role = (row.get("role") or "").strip().lower()
-            team = (row.get("team") or "").strip()
-            if not name or not email:
-                raise ValueError(f"Row {i}: missing name or email")
-            if role not in ("participant", "judge", "mentor"):
-                raise ValueError(f"Row {i}: role must be 'participant', 'judge', or 'mentor', got '{role}'")
-            rows.append({"name": name, "email": email, "role": role, "team": team})
-    return rows
+def slug(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()
+    return cleaned or "attendee"
 
 
-def assign_ids(rows):
-    counters = {"participant": 0, "judge": 0, "mentor": 0}
-    seen_emails = set()
-    for row in rows:
-        if row["email"].lower() in seen_emails:
-            raise ValueError(f"Duplicate email in CSV: {row['email']}")
-        seen_emails.add(row["email"].lower())
-
-        counters[row["role"]] += 1
-        prefix = {"participant": "P", "judge": "J", "mentor": "M"}[row["role"]]
-        row["id"] = f"{EVENT_CODE}-{prefix}{counters[row['role']]:03d}"
-    return rows
+def qr_filename(row: dict) -> str:
+    label = row["email"] or row["name"] or row["user_id"]
+    return f"{slug(label)}__{row['user_id']}.png"
 
 
-def generate_qr_codes(rows, out_dir):
-    out_dir.mkdir(exist_ok=True)
-    for row in rows:
-        img = qrcode.make(row["id"])
-        img.save(out_dir / f"{row['id']}.png")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Generate check-in QR codes from Supabase.")
+    parser.add_argument("--event-id", help="events.id (defaults to EVENT_ID or the latest event)")
+    parser.add_argument("--out", type=Path, default=QR_DIR, help="Output directory (default: qr_codes)")
+    args = parser.parse_args()
 
+    event, roster = load_roster(args.event_id)
+    args.out.mkdir(exist_ok=True)
 
-def main():
-    rows = load_roster(CSV_PATH)
-    rows = assign_ids(rows)
-    generate_qr_codes(rows, QR_DIR)
+    if not roster:
+        print(f"No accepted hackers/mentors/judges for {event['name']} ({event['id']}).")
+        print("Accept applications so they appear on v_checkin_list, then rerun.")
+        return
 
-    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
-        json.dump(rows, f, indent=2)
+    for row in roster:
+        img = qrcode.make(row["user_id"])
+        img.save(args.out / qr_filename(row))
 
-    participants = sum(1 for r in rows if r["role"] == "participant")
-    judges = sum(1 for r in rows if r["role"] == "judge")
-    mentors = sum(1 for r in rows if r["role"] == "mentor")
-    print(f"Generated {len(rows)} QR codes -> {QR_DIR}/")
-    print(f"  {participants} participants, {judges} judges, {mentors} mentors")
-    print(f"Wrote {OUTPUT_JSON} (used by the next two scripts)")
+    counts = {role: 0 for role in ("hacker", "judge", "mentor")}
+    for row in roster:
+        for role in row["roles"]:
+            if role in counts:
+                counts[role] += 1
+
+    print(f"Generated {len(roster)} QR codes -> {args.out}/")
+    print(f"  Event: {event['name']} ({event['id']})")
+    print(f"  {counts['hacker']} hackers, {counts['judge']} judges, {counts['mentor']} mentors")
+    print("Each QR encodes profiles.id (the value the check-in desk scans).")
 
 
 if __name__ == "__main__":
