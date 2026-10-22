@@ -1,8 +1,8 @@
 # DS3 DataHacks Check-In
 
-QR check-in desk for DataHacks. Organizers sign in, scan an attendee’s user UUID (or paste their email), and the app calls the Supabase `check_in_attendee` RPC.
+QR check-in desk for DataHacks. Organizers sign in, scan an attendee code such as `DH26-H001`, and the app calls `check_in_by_code`.
 
-The live roster comes from `v_checkin_list` (accepted hackers, mentors, and judges). Check-in writes a row to `checkins`.
+The live roster is `public.attendees`, filled automatically when an application is **accepted** (`upsert_attendee`). Check-in writes `attendees.checked_in_at`.
 
 ## Local
 
@@ -13,11 +13,9 @@ cp .env.example .env
 npm run dev
 ```
 
-Open http://localhost:5173 and sign in with an **organizer** account.
+Open http://localhost:5173 and sign in with an **organizer** account (`event_roles.role = 'organizer'`).
 
-That account must have `event_roles.role = 'organizer'` for the event. The RPC and RLS both depend on `is_event_staff()`.
-
-Current event in this project:
+Current event:
 
 ```sql
 -- DataHacks 2026
@@ -30,43 +28,29 @@ values (
 );
 ```
 
+Apply the check-in SQL in the Supabase SQL Editor first so `events.code`, `attendees`, `check_in_by_code`, and `undo_check_in` exist.
+
 ## Vercel
 
 1. Import this repo in Vercel (framework: Vite).
-2. Set the same env vars as `.env.example`:
-   - `VITE_SUPABASE_URL`
-   - `VITE_SUPABASE_ANON_KEY`
+2. Set `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`.
 3. Deploy.
 
-```bash
-npx vercel
-```
-
-Vite inlines `VITE_*` variables at **build** time, so change them in Vercel and redeploy if they rotate.
+Vite inlines `VITE_*` at **build** time, so rotate them → redeploy.
 
 ## How check-in maps to Supabase
 
 | App action | Backend |
 | --- | --- |
-| Load attendees | `v_checkin_list` filtered by the latest `events` row |
-| Scan / manual check-in | `check_in_attendee(p_event_id, p_user_id)` |
-| Duplicate scan | RPC returns `already_checked_in: true` |
-| Team column | `team_members` + `teams` (blank if RLS blocks it) |
+| Load roster | `attendees` for the event with a `code` |
+| Scan / manual / list check-in | `check_in_by_code(p_event_id, p_code)` |
+| Duplicate scan | RPC returns `{ status: "dupe" }` |
+| Undo | `undo_check_in(p_event_id, p_code)` |
+| Live updates | Realtime on `attendees` |
 
-QR payloads should be the attendee `profiles.id` UUID. Email works as a fallback once that person is on the roster.
-
-## Organizer setup checklist
-
-1. Create the staff user in Supabase Auth.
-2. Ensure they have a `profiles` row (`id` = auth user id).
-3. Insert `event_roles (event_id, user_id, role)` with `role = 'organizer'`.
-4. Accept hacker / mentor / judge applications so `promote_accepted` fills `event_roles` and they appear on `v_checkin_list`.
+Codes: `DH26-H001` (hacker), `DH26-J001` (judge), `DH26-M001` (mentor), `DH26-B001` (mentor+judge). Email still resolves to a code if that person is on the roster.
 
 ## QR codes and email passes
-
-Both scripts read accepted attendees from `v_checkin_list`. The QR / Wallet barcode is the attendee’s `profiles.id` UUID (what the desk scans).
-
-Put `SUPABASE_SERVICE_ROLE_KEY` in `.env` (Dashboard → Settings → API). The anon key cannot read the full roster because of RLS. Do not put the service role key in Vercel or the frontend.
 
 ```bash
 pip install -r requirements.txt
@@ -75,4 +59,6 @@ python send_emails.py --dry-run
 python send_emails.py
 ```
 
-`send_emails.py` also needs `WALLETWALLET_API_KEY`, `GMAIL_ADDRESS`, and `GMAIL_APP_PASSWORD`. Passes are cached in `wallet_passes/<user_id>.pkpass` so a retry does not burn WalletWallet quota.
+Scripts read `attendees` with `SUPABASE_SERVICE_ROLE_KEY`. QR / Wallet barcodes are `attendees.code`. Successful sends set `emailed_at`; use `--resend` to email those people again.
+
+Do not put the service role key in Vercel or the frontend. `send_emails.py` also needs `WALLETWALLET_API_KEY`, `GMAIL_ADDRESS`, and `GMAIL_APP_PASSWORD`. Passes are cached in `wallet_passes/<code>.pkpass`.

@@ -3,15 +3,13 @@ import "./style.css";
 
 const ROLES = ["hacker", "judge", "mentor"];
 const ROLE_LABELS = { hacker: "Hackers", judge: "Judges", mentor: "Mentors" };
-const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 let roster = [];
 let eventId = null;
 let lastScanId = null;
 let lastScanTime = 0;
 let html5QrCode = null;
-let checkinsChannel = null;
+let attendeesChannel = null;
 
 function escapeHtml(s) {
   const d = document.createElement("div");
@@ -22,11 +20,6 @@ function escapeHtml(s) {
 function formatTime(iso) {
   if (!iso) return null;
   return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
-
-function displayName(person) {
-  const name = [person.first_name, person.last_name].filter(Boolean).join(" ").trim();
-  return name || person.email || person.user_id;
 }
 
 function roleList(person) {
@@ -61,59 +54,49 @@ function showApp() {
   document.getElementById("app").classList.remove("app-hidden");
 }
 
+function normalizeRow(row) {
+  const roles = Array.isArray(row.roles) ? row.roles : [];
+  return {
+    id: row.id,
+    code: (row.code || "").toUpperCase(),
+    name: row.name || row.email || row.code,
+    email: row.email || "",
+    roles,
+    team: row.team || "",
+    checked_in: !!row.checked_in_at,
+    checked_in_at: row.checked_in_at,
+    at: formatTime(row.checked_in_at),
+  };
+}
+
 async function loadEvent() {
   const { data, error } = await supabase
     .from("events")
-    .select("id, name, starts_at")
+    .select("id, name, starts_at, code")
     .order("starts_at", { ascending: false });
 
   if (error) throw error;
   if (!data?.length) {
     throw new Error('No rows in the "events" table.');
   }
-  const event = data[0];
+  const event = data.find((row) => row.code) || data[0];
+  if (!event.code) {
+    throw new Error("This event has no code. Run the check-in SQL and set events.code (e.g. DH26).");
+  }
   eventId = event.id;
-  document.getElementById("event-badge").textContent = event.name;
+  document.getElementById("event-badge").textContent = `${event.name} · ${event.code}`;
   return event;
 }
 
-async function loadTeamsByUser() {
-  const map = new Map();
-  const { data, error } = await supabase
-    .from("team_members")
-    .select("user_id, teams(name)")
-    .eq("event_id", eventId);
-  if (error || !data) return map;
-  for (const row of data) {
-    const name = row.teams?.name;
-    if (name) map.set(row.user_id, name);
-  }
-  return map;
-}
-
-function normalizeRow(row, teamsByUser) {
-  const roles = Array.isArray(row.roles) ? row.roles : [];
-  return {
-    user_id: row.user_id,
-    first_name: row.first_name,
-    last_name: row.last_name,
-    email: row.email,
-    roles,
-    checked_in: !!row.checked_in,
-    checked_in_at: row.checked_in_at,
-    at: formatTime(row.checked_in_at),
-    team: teamsByUser.get(row.user_id) || "",
-  };
-}
-
 async function loadRoster() {
-  const [{ data, error }, teamsByUser] = await Promise.all([
-    supabase.from("v_checkin_list").select("*").eq("event_id", eventId),
-    loadTeamsByUser(),
-  ]);
+  const { data, error } = await supabase
+    .from("attendees")
+    .select("id, event_id, code, name, email, roles, team, checked_in_at")
+    .eq("event_id", eventId)
+    .order("code");
 
   if (error) throw error;
-  roster = (data || []).map((row) => normalizeRow(row, teamsByUser));
+  roster = (data || []).map(normalizeRow);
 
   ROLES.forEach((role) => {
     if (document.getElementById("view-" + role).classList.contains("active")) {
@@ -122,19 +105,19 @@ async function loadRoster() {
   });
 }
 
-async function subscribeCheckins() {
-  if (checkinsChannel) {
-    await supabase.removeChannel(checkinsChannel);
-    checkinsChannel = null;
+async function subscribeAttendees() {
+  if (attendeesChannel) {
+    await supabase.removeChannel(attendeesChannel);
+    attendeesChannel = null;
   }
-  checkinsChannel = supabase
-    .channel(`checkins:${eventId}`)
+  attendeesChannel = supabase
+    .channel(`attendees:${eventId}`)
     .on(
       "postgres_changes",
       {
         event: "*",
         schema: "public",
-        table: "checkins",
+        table: "attendees",
         filter: `event_id=eq.${eventId}`,
       },
       () => {
@@ -144,20 +127,16 @@ async function subscribeCheckins() {
     .subscribe();
 }
 
-function findPerson(raw) {
-  const id = raw.trim();
-  if (!id) return null;
-  const lower = id.toLowerCase();
-
-  if (UUID_RE.test(id)) {
-    return roster.find((p) => p.user_id === id) || { user_id: id, roles: [], email: "" };
-  }
-
-  return (
+function resolveCode(raw) {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) return "";
+  const upper = trimmed.toUpperCase();
+  const lower = trimmed.toLowerCase();
+  const match =
+    roster.find((p) => p.code === upper) ||
     roster.find((p) => (p.email || "").toLowerCase() === lower) ||
-    roster.find((p) => displayName(p).toLowerCase() === lower) ||
-    null
-  );
+    roster.find((p) => (p.name || "").toLowerCase() === lower);
+  return match ? match.code : upper;
 }
 
 function setStatus(kind, html) {
@@ -166,58 +145,90 @@ function setStatus(kind, html) {
   card.innerHTML = html;
 }
 
+function personMeta(data) {
+  const roles = Array.isArray(data?.roles) ? data.roles.join(", ").toUpperCase() : "ATTENDEE";
+  const team = data?.team ? ` · ${data.team}` : "";
+  const at = formatTime(data?.checked_in_at);
+  return { roles, team, at };
+}
+
 async function processCode(rawText) {
   const raw = String(rawText || "").trim();
+  const code = resolveCode(raw);
   const now = Date.now();
-  if (!raw) return;
-  if (raw === lastScanId && now - lastScanTime < 3000) return;
-  lastScanId = raw;
+  if (!code) return;
+  if (code === lastScanId && now - lastScanTime < 3000) return;
+  lastScanId = code;
   lastScanTime = now;
 
-  setStatus("", `<div class="placeholder">Looking up ${escapeHtml(raw)}…</div>`);
+  setStatus("", `<div class="placeholder">Looking up ${escapeHtml(code)}…</div>`);
 
-  const person = findPerson(raw);
-  if (!person) {
-    setStatus(
-      "error",
-      `<div class="icon">⚠️</div><div><div class="name">Unrecognized code</div><div class="meta">"${escapeHtml(raw)}" doesn't match a user UUID or roster email</div></div>`
-    );
-    return;
-  }
-
-  const { data, error } = await supabase.rpc("check_in_attendee", {
+  const { data, error } = await supabase.rpc("check_in_by_code", {
     p_event_id: eventId,
-    p_user_id: person.user_id,
+    p_code: code,
   });
 
   if (error) {
-    const message = error.message || String(error);
-    const unknown =
-      /not accepted/i.test(message) || /not found/i.test(message);
     setStatus(
       "error",
-      `<div class="icon">${unknown ? "⚠️" : "🚫"}</div><div><div class="name">${unknown ? "Not accepted for this event" : "Check-in failed"}</div><div class="meta">${escapeHtml(message)}</div></div>`
+      `<div class="icon">🚫</div><div><div class="name">Check-in failed</div><div class="meta">${escapeHtml(error.message || error)}</div></div>`
     );
     return;
   }
 
-  const already = data?.already_checked_in;
-  const at = formatTime(data?.checked_in_at);
-  const name = displayName(person) || person.user_id;
-  const roles = roleList(person).join(", ").toUpperCase() || "ATTENDEE";
+  const status = data?.status;
+  const meta = personMeta(data);
 
-  if (already) {
+  if (status === "unknown") {
     setStatus(
       "error",
-      `<div class="icon">↩️</div><div><div class="name">${escapeHtml(name)} — already checked in</div><div class="meta">${escapeHtml(roles)}${at ? " · at " + at : ""}</div></div>`
+      `<div class="icon">⚠️</div><div><div class="name">Unrecognized code</div><div class="meta">"${escapeHtml(raw)}" is not on the attendees roster</div></div>`
+    );
+    return;
+  }
+
+  if (status === "dupe") {
+    setStatus(
+      "error",
+      `<div class="icon">↩️</div><div><div class="name">${escapeHtml(data.name)} — already checked in</div><div class="meta">${escapeHtml(data.code)} · ${escapeHtml(meta.roles)}${meta.at ? " · at " + meta.at : ""}</div></div>`
+    );
+  } else if (status === "ok") {
+    setStatus(
+      "success",
+      `<div class="icon">✅</div><div><div class="name">${escapeHtml(data.name)}</div><div class="meta">${escapeHtml(data.code)} · ${escapeHtml(meta.roles)}${escapeHtml(meta.team)} · checked in ${escapeHtml(meta.at || "")}</div></div>`
     );
   } else {
     setStatus(
-      "success",
-      `<div class="icon">✅</div><div><div class="name">${escapeHtml(name)}</div><div class="meta">${escapeHtml(roles)}${person.team ? " · " + escapeHtml(person.team) : ""} · checked in ${escapeHtml(at || "")}</div></div>`
+      "error",
+      `<div class="icon">🚫</div><div><div class="name">Unexpected response</div><div class="meta">${escapeHtml(JSON.stringify(data))}</div></div>`
     );
   }
 
+  try {
+    await loadRoster();
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+async function undoCode(code) {
+  const { data, error } = await supabase.rpc("undo_check_in", {
+    p_event_id: eventId,
+    p_code: code,
+  });
+  if (error) {
+    setStatus(
+      "error",
+      `<div class="icon">🚫</div><div><div class="name">Undo failed</div><div class="meta">${escapeHtml(error.message || error)}</div></div>`
+    );
+    return;
+  }
+  if (data?.status === "ok") {
+    setStatus(
+      "",
+      `<div class="placeholder">Undid check-in for ${escapeHtml(data.name || data.code)}</div>`
+    );
+  }
   try {
     await loadRoster();
   } catch (err) {
@@ -241,7 +252,7 @@ function renderRoleView(role) {
       statusFilter === "all" ? true : statusFilter === "in" ? p.checked_in : !p.checked_in
     )
     .filter((p) => {
-      const hay = `${displayName(p)} ${p.email || ""} ${p.user_id}`.toLowerCase();
+      const hay = `${p.name} ${p.email || ""} ${p.code}`.toLowerCase();
       return hay.includes(search);
     });
 
@@ -257,31 +268,39 @@ function renderRoleView(role) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td><span class="dot ${p.checked_in ? "in" : "out"}"></span>${p.checked_in ? "Checked in" : "Not yet"}</td>
-      <td>${escapeHtml(displayName(p))}</td>
-      <td style="font-family:'IBM Plex Mono',monospace; font-size:0.75rem;">${escapeHtml(p.email || p.user_id)}</td>
+      <td>${escapeHtml(p.name)}</td>
+      <td style="font-family:'IBM Plex Mono',monospace; font-size:0.75rem;">${escapeHtml(p.code)}</td>
       <td>${escapeHtml(p.team || "—")}</td>
       <td>${escapeHtml(p.at || "—")}</td>
-      <td>${p.checked_in ? "" : `<button class="ghost" data-id="${p.user_id}" style="padding:5px 10px; font-size:0.75rem;">Check in</button>`}</td>
+      <td>${
+        p.checked_in
+          ? `<button class="ghost" data-undo="${p.code}" style="padding:5px 10px; font-size:0.75rem;">Undo</button>`
+          : `<button class="ghost" data-code="${p.code}" style="padding:5px 10px; font-size:0.75rem;">Check in</button>`
+      }</td>
     `;
     body.appendChild(tr);
   });
 
-  body.querySelectorAll("button[data-id]").forEach((btn) => {
+  body.querySelectorAll("button[data-code]").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      await processCode(btn.dataset.id);
-      renderRoleView(role);
+      await processCode(btn.dataset.code);
+    });
+  });
+  body.querySelectorAll("button[data-undo]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      await undoCode(btn.dataset.undo);
     });
   });
 }
 
 function exportRole(role) {
   const rows = roster.filter((r) => roleList(r).includes(role));
-  const out = [["Name", "Email", "User ID", "Team", "Checked In", "Time"]];
+  const out = [["Name", "Code", "Email", "Team", "Checked In", "Time"]];
   rows.forEach((p) =>
     out.push([
-      displayName(p),
+      p.name,
+      p.code,
       p.email || "",
-      p.user_id,
       p.team,
       p.checked_in ? "yes" : "no",
       p.at || "",
@@ -306,7 +325,7 @@ ROLES.forEach((role) => {
         <div class="count-line" id="${role}-count">— / —</div>
       </div>
       <div class="toolbar">
-        <input id="${role}-search" placeholder="Search by name, email, or ID…">
+        <input id="${role}-search" placeholder="Search by name, code, or email…">
         <select id="${role}-status-filter">
           <option value="all">All</option>
           <option value="in">Checked in</option>
@@ -315,7 +334,7 @@ ROLES.forEach((role) => {
         <button class="ghost" id="${role}-export-btn" type="button">Export CSV</button>
       </div>
       <table>
-        <thead><tr><th>Status</th><th>Name</th><th>Email</th><th>Team</th><th>Checked in at</th><th></th></tr></thead>
+        <thead><tr><th>Status</th><th>Name</th><th>Code</th><th>Team</th><th>Checked in at</th><th></th></tr></thead>
         <tbody id="${role}-body"></tbody>
       </table>
     </div>
@@ -401,9 +420,9 @@ document.getElementById("sign-out-btn").addEventListener("click", async () => {
     }
     html5QrCode = null;
   }
-  if (checkinsChannel) {
-    await supabase.removeChannel(checkinsChannel);
-    checkinsChannel = null;
+  if (attendeesChannel) {
+    await supabase.removeChannel(attendeesChannel);
+    attendeesChannel = null;
   }
   await supabase.auth.signOut();
 });
@@ -414,17 +433,17 @@ async function startSession(session) {
   try {
     await loadEvent();
     await loadRoster();
-    await subscribeCheckins();
+    await subscribeAttendees();
     showApp();
     if (roster.length === 0) {
       setStatus(
         "",
-        `<div class="placeholder">Connected, but nobody has an accepted hacker/mentor/judge role for this event yet.</div>`
+        `<div class="placeholder">Connected, but the attendees roster is empty. Accept applications after setting events.code so upsert_attendee can fill the table.</div>`
       );
     }
   } catch (err) {
     showBootError(
-      `Couldn't reach Supabase.<br><span style="font-size:0.7rem">${escapeHtml(err.message || err)}</span><br><br>Sign in as an organizer with an event_roles row of role <code>organizer</code>.`
+      `Couldn't reach Supabase.<br><span style="font-size:0.7rem">${escapeHtml(err.message || err)}</span><br><br>Sign in as an organizer, and confirm the check-in SQL has been applied.`
     );
   }
 }

@@ -1,13 +1,14 @@
 """
-Create an Apple Wallet pass for each accepted attendee (barcode = user UUID)
+Create an Apple Wallet pass for each attendee (barcode = DH26-H001 style code)
 and email it.
 
-Roster comes from Supabase v_checkin_list, not a CSV.
+Roster comes from public.attendees.
 
 Usage:
     pip install -r requirements.txt
     python send_emails.py --dry-run
     python send_emails.py
+    python send_emails.py --resend
     python send_emails.py --email someone@ucsd.edu
 """
 
@@ -24,7 +25,7 @@ from pathlib import Path
 
 import requests
 
-from supabase_roster import load_roster, require_env, role_labels
+from supabase_roster import load_roster, mark_emailed, require_env, role_labels
 
 WALLETWALLET_URL = "https://api.walletwallet.dev/api/passes?format=pkpass"
 ORG_NAME = "DataHacks"
@@ -33,21 +34,21 @@ PASS_DIR = Path("wallet_passes")
 
 def build_pass_payload(event_name: str, row: dict) -> dict:
     return {
-        "barcodeValue": row["user_id"],
+        "barcodeValue": row["code"],
         "barcodeFormat": "QR",
         "logoText": event_name,
         "organizationName": ORG_NAME,
         "primaryFields": [{"label": role_labels(row["roles"]).upper(), "value": row["name"]}],
         "secondaryFields": [
             {"label": "TEAM", "value": row.get("team") or "—"},
-            {"label": "CODE", "value": row["user_id"]},
+            {"label": "CODE", "value": row["code"]},
         ],
     }
 
 
 def get_or_create_pass(event_name: str, row: dict, api_key: str) -> Path:
     PASS_DIR.mkdir(exist_ok=True)
-    cache_path = PASS_DIR / f"{row['user_id']}.pkpass"
+    cache_path = PASS_DIR / f"{row['code']}.pkpass"
     if cache_path.exists():
         return cache_path
 
@@ -76,7 +77,7 @@ def build_email(from_addr: str, event_name: str, row: dict, pkpass_path: Path) -
         f"You're registered for {event_name} as a {roles}.\n\n"
         f"Open the attachment on your iPhone to add your check-in pass to Apple Wallet, "
         f"or show the QR code at the registration desk.\n\n"
-        f"Your check-in code is your account ID:\n{row['user_id']}\n\n"
+        f"Your check-in code: {row['code']}\n\n"
         f"See you there!"
     )
     with open(pkpass_path, "rb") as f:
@@ -84,17 +85,18 @@ def build_email(from_addr: str, event_name: str, row: dict, pkpass_path: Path) -
             f.read(),
             maintype="application",
             subtype="vnd.apple.pkpass",
-            filename=f"{row['user_id']}.pkpass",
+            filename=f"{row['code']}.pkpass",
         )
     return msg
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Email Apple Wallet check-in passes from Supabase.")
-    parser.add_argument("--event-id", help="events.id (defaults to EVENT_ID or the latest event)")
+    parser = argparse.ArgumentParser(description="Email Apple Wallet check-in passes from attendees.")
+    parser.add_argument("--event-id", help="events.id (defaults to EVENT_ID or the latest coded event)")
     parser.add_argument("--dry-run", action="store_true", help="List recipients; do not generate or send")
     parser.add_argument("--email", help="Send to this address only")
     parser.add_argument("--limit", type=int, default=0, help="Send at most N emails")
+    parser.add_argument("--resend", action="store_true", help="Include people who already have emailed_at set")
     args = parser.parse_args()
 
     event, roster = load_roster(args.event_id)
@@ -102,21 +104,28 @@ def main() -> None:
         target = args.email.strip().lower()
         roster = [row for row in roster if row["email"].lower() == target]
         if not roster:
-            raise SystemExit(f"No accepted attendee with email {args.email}")
+            raise SystemExit(f"No attendee with email {args.email}")
 
     missing_email = [row for row in roster if not row["email"]]
-    roster = [row for row in roster if row["email"]]
+    already = [] if args.resend else [row for row in roster if row["email"] and row.get("emailed_at")]
+    roster = [
+        row
+        for row in roster
+        if row["email"] and (args.resend or not row.get("emailed_at"))
+    ]
     if args.limit:
         roster = roster[: args.limit]
 
-    print(f"Event: {event['name']} ({event['id']})")
+    print(f"Event: {event['name']} ({event['code']})")
     print(f"Recipients: {len(roster)}")
     for row in missing_email:
-        print(f"  skip (no email): {row['name']} {row['user_id']}")
+        print(f"  skip (no email): {row['name']} {row['code']}")
+    for row in already:
+        print(f"  skip (already emailed): {row['email']} {row['code']}")
 
     if args.dry_run:
         for row in roster:
-            print(f"  would send -> {row['email']} ({role_labels(row['roles'])}) {row['user_id']}")
+            print(f"  would send -> {row['email']} ({row['code']}) {role_labels(row['roles'])}")
         return
 
     if not roster:
@@ -136,8 +145,9 @@ def main() -> None:
             try:
                 pkpass_path = get_or_create_pass(event["name"], row, api_key)
                 server.send_message(build_email(gmail_address, event["name"], row, pkpass_path))
+                mark_emailed(event["id"], row["code"])
                 sent += 1
-                print(f"[{sent}/{len(roster)}] sent -> {row['email']} ({row['user_id']})")
+                print(f"[{sent}/{len(roster)}] sent -> {row['email']} ({row['code']})")
             except Exception as exc:
                 failed.append((row["email"], str(exc)))
                 print(f"FAILED -> {row['email']}: {exc}")

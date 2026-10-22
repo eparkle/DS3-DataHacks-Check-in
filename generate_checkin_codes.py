@@ -1,7 +1,7 @@
 """
-Generate QR images whose payload is each attendee’s Supabase user UUID.
+Generate QR images whose payload is each attendee’s short code (e.g. DH26-H001).
 
-The desk scanner and check_in_attendee() both expect that UUID.
+Codes are created in Supabase by next_attendee_code() when an application is accepted.
 
 Usage:
     pip install -r requirements.txt
@@ -28,13 +28,12 @@ def slug(value: str) -> str:
 
 
 def qr_filename(row: dict) -> str:
-    label = row["email"] or row["name"] or row["user_id"]
-    return f"{slug(label)}__{row['user_id']}.png"
+    return f"{row['code']}__{slug(row['name'] or row['email'])}.png"
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate check-in QR codes from Supabase.")
-    parser.add_argument("--event-id", help="events.id (defaults to EVENT_ID or the latest event)")
+    parser = argparse.ArgumentParser(description="Generate check-in QR codes from attendees.")
+    parser.add_argument("--event-id", help="events.id (defaults to EVENT_ID or the latest coded event)")
     parser.add_argument("--out", type=Path, default=QR_DIR, help="Output directory (default: qr_codes)")
     args = parser.parse_args()
 
@@ -42,12 +41,12 @@ def main() -> None:
     args.out.mkdir(exist_ok=True)
 
     if not roster:
-        print(f"No accepted hackers/mentors/judges for {event['name']} ({event['id']}).")
-        print("Accept applications so they appear on v_checkin_list, then rerun.")
+        print(f"No attendees for {event['name']} ({event['id']}).")
+        print("Accept applications after setting events.code so upsert_attendee can fill public.attendees.")
         return
 
     for row in roster:
-        img = qrcode.make(row["user_id"])
+        img = qrcode.make(row["code"])
         img.save(args.out / qr_filename(row))
 
     counts = {role: 0 for role in ("hacker", "judge", "mentor")}
@@ -57,9 +56,9 @@ def main() -> None:
                 counts[role] += 1
 
     print(f"Generated {len(roster)} QR codes -> {args.out}/")
-    print(f"  Event: {event['name']} ({event['id']})")
+    print(f"  Event: {event['name']} ({event['code']})")
     print(f"  {counts['hacker']} hackers, {counts['judge']} judges, {counts['mentor']} mentors")
-    print("Each QR encodes profiles.id (the value the check-in desk scans).")
+    print("Each QR encodes attendees.code (what check_in_by_code expects).")
 
 
 if __name__ == "__main__":
