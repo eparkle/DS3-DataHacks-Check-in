@@ -30,14 +30,6 @@ values (
 
 Apply the check-in SQL in the Supabase SQL Editor first so `events.code`, `attendees`, `check_in_by_code`, and `undo_check_in` exist.
 
-## Vercel
-
-1. Import this repo in Vercel (framework: Vite).
-2. Set `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`.
-3. Deploy.
-
-Vite inlines `VITE_*` at **build** time, so rotate them → redeploy.
-
 ## How check-in maps to Supabase
 
 | App action | Backend |
