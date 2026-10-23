@@ -7,6 +7,7 @@ Roster comes from public.attendees.
 Usage:
     pip install -r requirements.txt
     python send_emails.py --dry-run
+    python send_emails.py --event-id eb6c5817-16ef-431c-a38b-6d978363885f --dry-run
     python send_emails.py
     python send_emails.py --resend
     python send_emails.py --email someone@ucsd.edu
