@@ -3,9 +3,16 @@ import "./style.css";
 
 const ROLES = ["hacker", "judge", "mentor"];
 const ROLE_LABELS = { hacker: "Hackers", judge: "Judges", mentor: "Mentors" };
+// Only used when the organizer's events can't be loaded from event_roles.
+const FALLBACK_EVENT_ID = (import.meta.env.VITE_EVENT_ID || "").trim();
+const EVENT_STORAGE_PREFIX = "datahacks-checkin:event:";
 
 let roster = [];
 let eventId = null;
+let currentEvent = null;
+let events = [];
+let usingFallback = false;
+let sessionUserId = null;
 let lastScanId = null;
 let lastScanTime = 0;
 let html5QrCode = null;
@@ -69,33 +76,164 @@ function normalizeRow(row) {
   };
 }
 
-async function loadEvent() {
+function readStoredEventId(userId) {
+  try {
+    return localStorage.getItem(EVENT_STORAGE_PREFIX + userId);
+  } catch {
+    return null;
+  }
+}
+
+function storeEventId(userId, id) {
+  try {
+    localStorage.setItem(EVENT_STORAGE_PREFIX + userId, id);
+  } catch {
+    /* ignore */
+  }
+}
+
+// Newest event first: starts_at desc (events without a date last), then the
+// most recent organizer grant. events has no created_at column.
+function compareEvents(a, b) {
+  const aStart = a.starts_at ? Date.parse(a.starts_at) : -Infinity;
+  const bStart = b.starts_at ? Date.parse(b.starts_at) : -Infinity;
+  if (aStart !== bStart) return bStart - aStart;
+  return Date.parse(b.role_created_at || 0) - Date.parse(a.role_created_at || 0);
+}
+
+async function loadOrganizerEvents(userId) {
   const { data, error } = await supabase
-    .from("events")
-    .select("id, name, starts_at, code")
-    .order("starts_at", { ascending: false });
+    .from("event_roles")
+    .select("created_at, events(id, name, code, starts_at)")
+    .eq("user_id", userId)
+    .eq("role", "organizer");
+
+  if (error) throw error;
+  const byId = new Map();
+  (data || []).forEach((row) => {
+    const event = row.events;
+    if (!event?.id || !event.code || byId.has(event.id)) return;
+    byId.set(event.id, { ...event, role_created_at: row.created_at });
+  });
+  return [...byId.values()].sort(compareEvents);
+}
+
+// The pre-picker behaviour: VITE_EVENT_ID if set, else the newest event with a code.
+async function loadFallbackEvent() {
+  let query = supabase.from("events").select("id, name, starts_at, code");
+  query = FALLBACK_EVENT_ID
+    ? query.eq("id", FALLBACK_EVENT_ID)
+    : query.order("starts_at", { ascending: false, nullsFirst: false });
+  const { data, error } = await query;
 
   if (error) throw error;
   if (!data?.length) {
-    throw new Error('No rows in the "events" table.');
+    throw new Error(
+      FALLBACK_EVENT_ID ? `No event with id ${FALLBACK_EVENT_ID} (VITE_EVENT_ID).` : 'No rows in the "events" table.'
+    );
   }
   const event = data.find((row) => row.code) || data[0];
   if (!event.code) {
     throw new Error("This event has no code. Run the check-in SQL and set events.code (e.g. DH26).");
   }
-  eventId = event.id;
-  document.getElementById("event-badge").textContent = `${event.name} · ${event.code}`;
   return event;
 }
 
+function renderEventPicker() {
+  const select = document.getElementById("event-select");
+  select.innerHTML = events
+    .map((e) => `<option value="${escapeHtml(e.id)}">${escapeHtml(e.code)} · ${escapeHtml(e.name)}</option>`)
+    .join("");
+  select.value = eventId;
+  select.disabled = events.length < 2;
+
+  document.querySelectorAll(".current-event-code").forEach((el) => {
+    el.textContent = currentEvent.code;
+  });
+  document.querySelectorAll(".current-event-name").forEach((el) => {
+    el.textContent = usingFallback
+      ? `${currentEvent.name} (fallback: couldn't load the events you organize)`
+      : currentEvent.name;
+  });
+  document.querySelectorAll(".event-banner").forEach((el) => el.classList.toggle("fallback", usingFallback));
+  document.title = `${currentEvent.code} · DataHacks Check-In`;
+}
+
+async function loadEvent(userId) {
+  let list = [];
+  try {
+    list = await loadOrganizerEvents(userId);
+  } catch (err) {
+    console.error("Couldn't load organizer events; using fallback event", err);
+  }
+
+  if (list.length) {
+    usingFallback = false;
+    events = list;
+    const stored = readStoredEventId(userId);
+    currentEvent = list.find((e) => e.id === stored) || list[0];
+  } else {
+    usingFallback = true;
+    currentEvent = await loadFallbackEvent();
+    events = [currentEvent];
+  }
+  eventId = currentEvent.id;
+  renderEventPicker();
+  return currentEvent;
+}
+
+async function switchEvent(nextId) {
+  const select = document.getElementById("event-select");
+  const next = events.find((e) => e.id === nextId);
+  if (!next || next.id === eventId) {
+    select.value = eventId;
+    return;
+  }
+  const ok = window.confirm(
+    `Switch check-in from ${currentEvent.code} to ${next.code}?\n\n${next.name}\n\nEvery scan, check-in and undo after this goes to ${next.code}.`
+  );
+  if (!ok) {
+    select.value = eventId;
+    return;
+  }
+
+  currentEvent = next;
+  eventId = next.id;
+  storeEventId(sessionUserId, next.id);
+  roster = [];
+  lastScanId = null;
+  renderEventPicker();
+  select.disabled = true;
+  setStatus("", `<div class="placeholder">Switched to ${escapeHtml(next.code)}. Loading roster…</div>`);
+
+  try {
+    await loadRoster();
+    await subscribeAttendees();
+    setStatus(
+      "",
+      `<div class="placeholder">Now checking in to ${escapeHtml(next.code)} · ${roster.length} on the roster.</div>`
+    );
+  } catch (err) {
+    setStatus(
+      "error",
+      `<div class="icon">🚫</div><div><div class="name">Couldn't load ${escapeHtml(next.code)}</div><div class="meta">${escapeHtml(err.message || err)}</div></div>`
+    );
+  } finally {
+    select.disabled = events.length < 2;
+  }
+}
+
 async function loadRoster() {
+  const requestedEventId = eventId;
   const { data, error } = await supabase
     .from("attendees")
     .select("id, event_id, code, name, email, roles, team, checked_in_at")
-    .eq("event_id", eventId)
+    .eq("event_id", requestedEventId)
     .order("code");
 
   if (error) throw error;
+  // The organizer switched events while this was in flight.
+  if (requestedEventId !== eventId) return;
   roster = (data || []).map(normalizeRow);
 
   ROLES.forEach((role) => {
@@ -180,9 +318,15 @@ async function processCode(rawText) {
   const meta = personMeta(data);
 
   if (status === "unknown") {
+    const prefix = (code.match(/^([A-Z0-9]{2,10})-[HJMB]\d+$/) || [])[1] || "";
+    const eventCode = (currentEvent?.code || "").toUpperCase();
+    const hint =
+      prefix && eventCode && prefix !== eventCode
+        ? `This code is for ${prefix}, but you're checking in to ${eventCode}.`
+        : `"${raw}" is not on the ${eventCode} attendees roster`;
     setStatus(
       "error",
-      `<div class="icon">⚠️</div><div><div class="name">Unrecognized code</div><div class="meta">"${escapeHtml(raw)}" is not on the attendees roster</div></div>`
+      `<div class="icon">⚠️</div><div><div class="name">Unrecognized code</div><div class="meta">${escapeHtml(hint)}</div></div>`
     );
     return;
   }
@@ -311,7 +455,7 @@ function exportRole(role) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `datahacks-${role}s-export.csv`;
+  a.download = `datahacks-${(currentEvent?.code || "event").toLowerCase()}-${role}s-export.csv`;
   a.click();
   URL.revokeObjectURL(url);
 }
@@ -353,6 +497,10 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
     view.classList.add("active");
     if (ROLES.includes(btn.dataset.view)) renderRoleView(btn.dataset.view);
   });
+});
+
+document.getElementById("event-select").addEventListener("change", (e) => {
+  switchEvent(e.target.value);
 });
 
 document.getElementById("manual-input").addEventListener("keydown", (e) => {
@@ -431,7 +579,7 @@ async function startSession(session) {
   document.getElementById("session-email").textContent = session.user.email || "";
   showBoot("Loading event…");
   try {
-    await loadEvent();
+    await loadEvent(session.user.id);
     await loadRoster();
     await subscribeAttendees();
     showApp();
@@ -442,6 +590,7 @@ async function startSession(session) {
       );
     }
   } catch (err) {
+    sessionUserId = null;
     showBootError(
       `Couldn't reach Supabase.<br><span style="font-size:0.7rem">${escapeHtml(err.message || err)}</span><br><br>Sign in as an organizer, and confirm the check-in SQL has been applied.`
     );
@@ -451,9 +600,15 @@ async function startSession(session) {
 supabase.auth.onAuthStateChange((_event, session) => {
   if (!session) {
     eventId = null;
+    currentEvent = null;
+    events = [];
     roster = [];
+    sessionUserId = null;
     showAuth();
     return;
   }
+  // Token refreshes and tab refocus re-emit the session; keep the selected event.
+  if (session.user.id === sessionUserId) return;
+  sessionUserId = session.user.id;
   startSession(session);
 });
