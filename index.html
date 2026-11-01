@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#0A1628">
 <title>DataHacks Check-In</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
@@ -38,7 +39,7 @@
 
 <div class="wrap app-hidden" id="app">
 
-  <header>
+  <header class="app-header">
     <div class="brand">
       <h1>DataHacks Check-In</h1>
       <label class="event-picker" for="event-select" title="Every check-in, undo and roster on this page uses this event">
@@ -48,17 +49,18 @@
         </select>
       </label>
     </div>
-    <div class="header-actions">
+    <div class="account">
       <span id="session-email"></span>
-      <button class="ghost" id="sign-out-btn" type="button">Sign out</button>
-      <nav>
-        <button class="tab-btn active" data-view="scan" type="button">Scan</button>
-        <button class="tab-btn" data-view="hacker" type="button">Hackers</button>
-        <button class="tab-btn" data-view="judge" type="button">Judges</button>
-        <button class="tab-btn" data-view="mentor" type="button">Mentors</button>
-      </nav>
+      <button class="ghost small" id="sign-out-btn" type="button">Sign out</button>
     </div>
   </header>
+
+  <nav class="tabs" aria-label="Sections">
+    <button class="tab-btn active" data-view="scan" type="button">Scan</button>
+    <button class="tab-btn" data-view="hacker" type="button">Hackers</button>
+    <button class="tab-btn" data-view="judge" type="button">Judges</button>
+    <button class="tab-btn" data-view="mentor" type="button">Mentors</button>
+  </nav>
 
   <div class="view active" id="view-scan">
     <div class="scan-grid">
@@ -76,9 +78,12 @@
         <div id="status-card">
           <div class="placeholder">Waiting for first scan…</div>
         </div>
-        <div class="manual">
-          <input id="manual-input" placeholder="Type a code like DH26-H001, or an email, then press Enter">
-        </div>
+        <form class="manual" id="manual-form" autocomplete="off">
+          <label class="visually-hidden" for="manual-input">Attendee code or email</label>
+          <input id="manual-input" type="text" placeholder="Code or email" enterkeyhint="go"
+                 autocapitalize="off" autocorrect="off" spellcheck="false">
+          <button class="ghost" id="manual-btn" type="submit">Check in</button>
+        </form>
         <p class="note">QR codes encode the attendee code (DH26-H001, DH26-J001, DH26-M001, DH26-B001). Email also works if they’re on the roster.</p>
       </div>
     </div>

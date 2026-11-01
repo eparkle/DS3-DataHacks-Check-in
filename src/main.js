@@ -453,16 +453,17 @@ function renderRoleView(role) {
 
   filtered.forEach((p) => {
     const tr = document.createElement("tr");
+    // Same cells feed the desktop table and the phone cards (see style.css).
     tr.innerHTML = `
-      <td><span class="dot ${p.checked_in ? "in" : "out"}"></span>${p.checked_in ? "Checked in" : "Not yet"}</td>
-      <td>${escapeHtml(p.name)}</td>
-      <td style="font-family:'IBM Plex Mono',monospace; font-size:0.75rem;">${escapeHtml(p.code)}</td>
-      <td>${escapeHtml(p.team || "—")}</td>
-      <td>${escapeHtml(p.at || "—")}</td>
-      <td>${
+      <td class="c-status"><span class="pill ${p.checked_in ? "in" : "out"}">${p.checked_in ? "Checked in" : "Not yet"}</span></td>
+      <td class="c-name">${escapeHtml(p.name)}</td>
+      <td class="c-code">${escapeHtml(p.code)}</td>
+      <td class="c-team${p.team ? "" : " is-empty"}">${escapeHtml(p.team || "—")}</td>
+      <td class="c-time${p.at ? "" : " is-empty"}">${p.at ? `<span class="c-time-prefix">at </span>${escapeHtml(p.at)}` : "—"}</td>
+      <td class="c-action">${
         p.checked_in
-          ? `<button class="ghost" data-undo="${p.code}" style="padding:5px 10px; font-size:0.75rem;">Undo</button>`
-          : `<button class="ghost" data-code="${p.code}" style="padding:5px 10px; font-size:0.75rem;">Check in</button>`
+          ? `<button class="ghost row-btn" type="button" data-undo="${escapeHtml(p.code)}">Undo</button>`
+          : `<button class="ghost row-btn" type="button" data-code="${escapeHtml(p.code)}">Check in</button>`
       }</td>
     `;
     body.appendChild(tr);
@@ -512,15 +513,16 @@ ROLES.forEach((role) => {
         <div class="count-line" id="${role}-count">— / —</div>
       </div>
       <div class="toolbar">
-        <input id="${role}-search" placeholder="Search by name, code, or email…">
-        <select id="${role}-status-filter">
+        <input id="${role}-search" type="search" placeholder="Search name, code, email" aria-label="Search ${ROLE_LABELS[role].toLowerCase()}"
+               autocapitalize="off" autocorrect="off" spellcheck="false">
+        <select id="${role}-status-filter" aria-label="Filter by status">
           <option value="all">All</option>
           <option value="in">Checked in</option>
           <option value="out">Not checked in</option>
         </select>
         <button class="ghost" id="${role}-export-btn" type="button">Export CSV</button>
       </div>
-      <table>
+      <table class="roster">
         <thead><tr><th>Status</th><th>Name</th><th>Code</th><th>Team</th><th>Checked in at</th><th></th></tr></thead>
         <tbody id="${role}-body"></tbody>
       </table>
@@ -546,11 +548,12 @@ document.getElementById("event-select").addEventListener("change", (e) => {
   switchEvent(e.target.value);
 });
 
-document.getElementById("manual-input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && e.target.value.trim()) {
-    processCode(e.target.value);
-    e.target.value = "";
-  }
+document.getElementById("manual-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const input = document.getElementById("manual-input");
+  if (!input.value.trim()) return;
+  processCode(input.value);
+  input.value = "";
 });
 
 document.getElementById("start-btn").addEventListener("click", async () => {
@@ -561,7 +564,14 @@ document.getElementById("start-btn").addEventListener("click", async () => {
     html5QrCode = new Html5Qrcode("reader");
     await html5QrCode.start(
       { facingMode: "environment" },
-      { fps: 10, qrbox: { width: 220, height: 220 } },
+      {
+        fps: 10,
+        // About 70% of the camera view, so the guide box fits narrow phones.
+        qrbox: (w, h) => {
+          const size = Math.min(250, Math.max(50, Math.floor(Math.min(w, h) * 0.7)));
+          return { width: size, height: size };
+        },
+      },
       (decodedText) => processCode(decodedText),
       () => {}
     );
