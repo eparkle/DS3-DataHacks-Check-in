@@ -15,7 +15,13 @@ npm run dev
 
 Open http://localhost:5173 and sign in with an **organizer** account (`event_roles.role = 'organizer'`).
 
-Current event:
+## Choosing the event
+
+After sign-in the app lists every event you are an organizer of (`event_roles` joined to `events`, events with a `code` only) and shows the one you're checking into in the header and above the scanner. It defaults to the last event you picked on that device (localStorage), otherwise the newest event (`starts_at`, latest first). Switching asks for confirmation; every check-in, undo, roster tab, CSV export and live update then uses the selected event.
+
+If your organizer events can't be loaded, the app falls back to `VITE_EVENT_ID` (if set) or the newest event with a code, and marks the banner as a fallback.
+
+To check people into an event, your account needs an organizer row for it, for example:
 
 ```sql
 -- DataHacks 2026
@@ -50,6 +56,8 @@ python generate_checkin_codes.py
 python send_emails.py --dry-run
 python send_emails.py
 ```
+
+Both scripts take `--event-id <events.id>` (or `EVENT_ID` in `.env`). Without either they use the newest event with a code, so pass `--event-id` and check the `Event:` line of a `--dry-run` before sending.
 
 Scripts read `attendees` with `SUPABASE_SERVICE_ROLE_KEY`. QR / Wallet barcodes are `attendees.code`. Successful sends set `emailed_at`; use `--resend` to email those people again.
 

@@ -31,7 +31,12 @@
   <header>
     <div class="brand">
       <h1>DataHacks Check-In</h1>
-      <span id="event-badge">—</span>
+      <label class="event-picker" for="event-select" title="Every check-in, undo and roster on this page uses this event">
+        <span class="event-picker-label">Checking in to</span>
+        <select id="event-select" disabled>
+          <option>—</option>
+        </select>
+      </label>
     </div>
     <div class="header-actions">
       <span id="session-email"></span>
@@ -48,6 +53,7 @@
   <div class="view active" id="view-scan">
     <div class="scan-grid">
       <div class="panel">
+        <div class="event-banner">Checking in to <b class="current-event-code">—</b> <span class="current-event-name"></span></div>
         <h2>Camera scanner</h2>
         <div id="reader-frame">
           <div id="reader"></div>
