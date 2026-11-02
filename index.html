@@ -67,9 +67,15 @@
       <div class="panel">
         <div class="event-banner">Checking in to <b class="current-event-code">—</b> <span class="current-event-name"></span></div>
         <h2>Camera scanner</h2>
-        <div id="reader-frame">
-          <div id="reader"></div>
-          <div class="corners"><span class="tl"></span><span class="tr"></span><span class="bl"></span><span class="br"></span></div>
+        <div id="reader-frame" data-state="idle">
+          <video id="scanner-video" playsinline muted autoplay disablepictureinpicture aria-label="Camera preview"></video>
+          <!-- Decorative only: the whole camera frame is scanned. -->
+          <div class="corners" aria-hidden="true"><span class="tl"></span><span class="tr"></span><span class="bl"></span><span class="br"></span></div>
+          <div id="scanner-overlay" role="status" aria-live="polite">
+            <div class="scanner-spinner" aria-hidden="true"></div>
+            <p id="scanner-message">Camera is off. Tap Start camera to scan.</p>
+            <button class="primary" id="scanner-retry" type="button" hidden>Retry</button>
+          </div>
         </div>
         <div class="scan-controls">
           <button class="primary" id="start-btn" type="button">Start camera</button>

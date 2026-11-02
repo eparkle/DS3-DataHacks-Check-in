@@ -1,4 +1,5 @@
 import { supabase } from "./supabase.js";
+import { QrScanner, prewarm as prewarmScanner } from "./scanner.js";
 import "./style.css";
 
 const ROLES = ["hacker", "judge", "mentor"];
@@ -17,7 +18,11 @@ let usingFallback = false;
 let sessionUserId = null;
 let lastScanId = null;
 let lastScanTime = 0;
-let html5QrCode = null;
+let scanner = null;
+// The organizer turned the camera on (Start) and hasn't pressed Stop. The
+// camera is released while the Scan tab or the page is hidden, and comes back
+// when they return.
+let cameraWanted = false;
 let attendeesChannel = null;
 let authUrlCleaned = false;
 
@@ -541,6 +546,7 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
     const view = document.getElementById("view-" + btn.dataset.view);
     view.classList.add("active");
     if (ROLES.includes(btn.dataset.view)) renderRoleView(btn.dataset.view);
+    syncCameraToVisibility();
   });
 });
 
@@ -556,43 +562,80 @@ document.getElementById("manual-form").addEventListener("submit", (e) => {
   input.value = "";
 });
 
-document.getElementById("start-btn").addEventListener("click", async () => {
+const SCANNER_MESSAGES = {
+  idle: "Camera is off. Tap Start camera to scan.",
+  starting: "Starting camera…",
+  paused: "Camera paused. It comes back when you return to this tab.",
+};
+
+function setScannerState(state, detail) {
+  const frame = document.getElementById("reader-frame");
+  const message = document.getElementById("scanner-message");
+  const retry = document.getElementById("scanner-retry");
   const startBtn = document.getElementById("start-btn");
   const stopBtn = document.getElementById("stop-btn");
-  try {
-    const { Html5Qrcode } = await import("html5-qrcode");
-    html5QrCode = new Html5Qrcode("reader");
-    await html5QrCode.start(
-      { facingMode: "environment" },
-      {
-        fps: 10,
-        // About 70% of the camera view, so the guide box fits narrow phones.
-        qrbox: (w, h) => {
-          const size = Math.min(250, Math.max(50, Math.floor(Math.min(w, h) * 0.7)));
-          return { width: size, height: size };
-        },
-      },
-      (decodedText) => processCode(decodedText),
-      () => {}
-    );
-    startBtn.disabled = true;
-    stopBtn.disabled = false;
-  } catch (err) {
-    setStatus(
-      "error",
-      `<div class="icon">🚫</div><div><div class="name">Camera unavailable</div><div class="meta">${escapeHtml(err)}. Check camera permissions, or use manual entry below.</div></div>`
-    );
-  }
-});
 
-document.getElementById("stop-btn").addEventListener("click", async () => {
-  if (html5QrCode) {
-    await html5QrCode.stop();
-    html5QrCode.clear();
-    html5QrCode = null;
+  if (state === "stopped") state = cameraWanted ? "paused" : "idle";
+  frame.dataset.state = state;
+  if (state === "scanning") frame.dataset.engine = detail?.engine || "";
+  message.textContent = state === "error" ? detail?.message || String(detail) : SCANNER_MESSAGES[state] || "";
+  retry.hidden = state !== "error";
+
+  const live = state === "starting" || state === "scanning";
+  startBtn.disabled = live;
+  stopBtn.disabled = !live && !cameraWanted;
+  if (state === "error") cameraWanted = false;
+  if (state === "error") stopBtn.disabled = true;
+}
+
+function getScanner() {
+  if (!scanner) {
+    const video = document.getElementById("scanner-video");
+    video.muted = true;
+    scanner = new QrScanner(video, {
+      onDecode: (text) => {
+        const frame = document.getElementById("reader-frame");
+        frame.classList.add("hit");
+        setTimeout(() => frame.classList.remove("hit"), 600);
+        processCode(text);
+      },
+      onState: setScannerState,
+    });
   }
-  document.getElementById("start-btn").disabled = false;
-  document.getElementById("stop-btn").disabled = true;
+  return scanner;
+}
+
+function scanTabVisible() {
+  return document.getElementById("view-scan").classList.contains("active") && document.visibilityState === "visible";
+}
+
+function startCamera() {
+  cameraWanted = true;
+  getScanner().start();
+}
+
+function stopCamera() {
+  cameraWanted = false;
+  if (scanner) scanner.stop();
+  else setScannerState("idle");
+}
+
+// Release the camera while it can't be seen; bring it back on return.
+function syncCameraToVisibility() {
+  if (!scanner) return;
+  if (cameraWanted && scanTabVisible()) {
+    if (!scanner.active) scanner.start();
+  } else if (scanner.active) {
+    scanner.stop();
+  }
+}
+
+document.getElementById("start-btn").addEventListener("click", startCamera);
+document.getElementById("scanner-retry").addEventListener("click", startCamera);
+document.getElementById("stop-btn").addEventListener("click", stopCamera);
+document.addEventListener("visibilitychange", syncCameraToVisibility);
+window.addEventListener("pagehide", () => {
+  if (scanner?.active) scanner.stop();
 });
 
 function resetGoogleButton() {
@@ -619,7 +662,10 @@ document.getElementById("google-btn").addEventListener("click", async () => {
 // Coming back with the browser's Back button from Google restores the page
 // from the back/forward cache with the button still disabled.
 window.addEventListener("pageshow", (e) => {
-  if (e.persisted) resetGoogleButton();
+  if (e.persisted) {
+    resetGoogleButton();
+    syncCameraToVisibility();
+  }
 });
 
 document.getElementById("login-form").addEventListener("submit", async (e) => {
@@ -639,15 +685,7 @@ document.getElementById("login-form").addEventListener("submit", async (e) => {
 });
 
 document.getElementById("sign-out-btn").addEventListener("click", async () => {
-  if (html5QrCode) {
-    try {
-      await html5QrCode.stop();
-      html5QrCode.clear();
-    } catch {
-      /* ignore */
-    }
-    html5QrCode = null;
-  }
+  stopCamera();
   if (attendeesChannel) {
     await supabase.removeChannel(attendeesChannel);
     attendeesChannel = null;
@@ -681,6 +719,8 @@ async function startSession(session) {
     await loadRoster();
     await subscribeAttendees();
     showApp();
+    // Fetch the QR decoder in the background so Start camera is instant.
+    (window.requestIdleCallback || ((fn) => setTimeout(fn, 200)))(() => prewarmScanner());
     if (roster.length === 0) {
       setStatus(
         "",
