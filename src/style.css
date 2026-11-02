@@ -197,10 +197,26 @@ tr:last-child td{ border-bottom:none; }
   font-family:'Inter', sans-serif; font-size:0.85rem; color:var(--muted);
   margin-bottom:20px; line-height:1.5;
 }
+.google-btn{
+  width:100%; min-height:46px;
+  display:flex; align-items:center; justify-content:center; gap:10px;
+  font-family:'Inter', sans-serif; font-weight:600; font-size:0.9rem;
+  background:#FFFFFF; color:#1F1F1F; border:1px solid #DADCE0; border-radius:9px;
+  padding:10px 18px; cursor:pointer;
+}
+.google-btn:hover{ background:#F1F3F4; }
+.google-btn:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+.google-logo{ flex-shrink:0; }
+.auth-divider{
+  display:flex; align-items:center; gap:10px; margin:18px 0 14px;
+  font-family:'IBM Plex Mono', monospace; font-size:0.7rem; color:var(--muted);
+}
+.auth-divider::before, .auth-divider::after{ content:""; flex:1; height:1px; background:var(--border); }
 .auth-form{ display:flex; flex-direction:column; gap:10px; }
 .auth-form input{ width:100%; }
 .auth-form button{ width:100%; margin-top:6px; }
-#auth-error{ font-family:'Inter', sans-serif; font-size:0.8rem; min-height:1.2em; }
+#auth-error{ font-family:'Inter', sans-serif; font-size:0.8rem; min-height:1.2em; line-height:1.4; }
+#boot-screen .boot-actions{ margin-top:6px; }
 #session-email{
   font-family:'IBM Plex Mono', monospace; font-size:0.72rem; color:var(--muted);
 }

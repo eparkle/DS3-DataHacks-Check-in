@@ -6,6 +6,8 @@ const ROLE_LABELS = { hacker: "Hackers", judge: "Judges", mentor: "Mentors" };
 // Only used when the organizer's events can't be loaded from event_roles.
 const FALLBACK_EVENT_ID = (import.meta.env.VITE_EVENT_ID || "").trim();
 const EVENT_STORAGE_PREFIX = "datahacks-checkin:event:";
+const NOT_ORGANIZER_MESSAGE = "This Google account isn't an organizer. Ask a DataHacks organizer to add you.";
+const NOT_ORGANIZER_PASSWORD_MESSAGE = "This account isn't an organizer. Ask a DataHacks organizer to add you.";
 
 let roster = [];
 let eventId = null;
@@ -17,6 +19,19 @@ let lastScanId = null;
 let lastScanTime = 0;
 let html5QrCode = null;
 let attendeesChannel = null;
+let authUrlCleaned = false;
+
+// An OAuth error (e.g. the person closed the Google screen) comes back in the
+// query string or hash. supabase-js only consumes successful sign-ins, so read
+// the error here and show it on the sign-in screen.
+const oauthError = (() => {
+  const params = new URLSearchParams(window.location.search);
+  const hash = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+  const description = params.get("error_description") || hash.get("error_description");
+  const code = params.get("error") || hash.get("error");
+  if (!description && !code) return null;
+  return (description || code).replace(/\+/g, " ");
+})();
 
 function escapeHtml(s) {
   const d = document.createElement("div");
@@ -51,8 +66,30 @@ function showBootError(html) {
   const boot = document.getElementById("boot-screen");
   boot.classList.remove("app-hidden");
   boot.classList.add("error");
-  document.getElementById("boot-message").innerHTML = html;
+  document.getElementById("boot-message").innerHTML =
+    html +
+    `<div class="boot-actions"><button class="ghost" id="boot-sign-out-btn" type="button">Sign out</button></div>`;
+  document.getElementById("boot-sign-out-btn").addEventListener("click", () => {
+    supabase.auth.signOut({ scope: "local" });
+  });
   document.getElementById("auth-screen").classList.add("app-hidden");
+}
+
+function setAuthError(message) {
+  document.getElementById("auth-error").textContent = message || "";
+}
+
+// After supabase-js has read the sign-in result from the URL, drop what is
+// left of it (an empty "#", or an OAuth error) so a reload starts clean.
+function cleanAuthUrl() {
+  if (authUrlCleaned) return;
+  authUrlCleaned = true;
+  const url = new URL(window.location.href);
+  ["error", "error_code", "error_description", "code", "state"].forEach((key) => url.searchParams.delete(key));
+  url.hash = "";
+  if (url.href !== window.location.href) {
+    window.history.replaceState(window.history.state, "", url.pathname + url.search);
+  }
 }
 
 function showApp() {
@@ -159,13 +196,19 @@ function renderEventPicker() {
   document.title = `${currentEvent.code} · DataHacks Check-In`;
 }
 
+// Resolves to null when the person is signed in but isn't an organizer of any
+// event. Nothing is rendered or loaded for them in that case.
 async function loadEvent(userId) {
   let list = [];
+  let listLoaded = false;
   try {
     list = await loadOrganizerEvents(userId);
+    listLoaded = true;
   } catch (err) {
     console.error("Couldn't load organizer events; using fallback event", err);
   }
+
+  if (listLoaded && !list.length) return null;
 
   if (list.length) {
     usingFallback = false;
@@ -542,6 +585,33 @@ document.getElementById("stop-btn").addEventListener("click", async () => {
   document.getElementById("stop-btn").disabled = true;
 });
 
+function resetGoogleButton() {
+  document.getElementById("google-btn").disabled = false;
+  document.getElementById("google-btn-label").textContent = "Sign in with Google";
+}
+
+document.getElementById("google-btn").addEventListener("click", async () => {
+  const btn = document.getElementById("google-btn");
+  setAuthError("");
+  btn.disabled = true;
+  document.getElementById("google-btn-label").textContent = "Opening Google…";
+  const { error } = await supabase.auth.signInWithOAuth({
+    provider: "google",
+    options: { redirectTo: window.location.origin + window.location.pathname },
+  });
+  // On success the browser is already leaving for Google.
+  if (error) {
+    resetGoogleButton();
+    setAuthError(error.message);
+  }
+});
+
+// Coming back with the browser's Back button from Google restores the page
+// from the back/forward cache with the button still disabled.
+window.addEventListener("pageshow", (e) => {
+  if (e.persisted) resetGoogleButton();
+});
+
 document.getElementById("login-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const btn = document.getElementById("login-btn");
@@ -575,11 +645,29 @@ document.getElementById("sign-out-btn").addEventListener("click", async () => {
   await supabase.auth.signOut();
 });
 
+// Signed in, but not an organizer of any event: sign out on this device only
+// (a global sign-out would also end their session on the DataHacks site).
+async function rejectNonOrganizer(session) {
+  const viaGoogle =
+    session.user.app_metadata?.provider === "google" ||
+    (session.user.identities || []).some((identity) => identity.provider === "google");
+  await supabase.auth.signOut({ scope: "local" });
+  setAuthError(viaGoogle ? NOT_ORGANIZER_MESSAGE : NOT_ORGANIZER_PASSWORD_MESSAGE);
+}
+
 async function startSession(session) {
-  document.getElementById("session-email").textContent = session.user.email || "";
-  showBoot("Loading event…");
+  const userId = session.user.id;
+  showBoot("Checking organizer access…");
   try {
-    await loadEvent(session.user.id);
+    const event = await loadEvent(userId);
+    // Signed out (or switched account) while this was loading.
+    if (sessionUserId !== userId) return;
+    if (!event) {
+      await rejectNonOrganizer(session);
+      return;
+    }
+    document.getElementById("session-email").textContent = session.user.email || "";
+    showBoot("Loading roster…");
     await loadRoster();
     await subscribeAttendees();
     showApp();
@@ -598,12 +686,17 @@ async function startSession(session) {
 }
 
 supabase.auth.onAuthStateChange((_event, session) => {
+  // The first event (INITIAL_SESSION) comes after supabase-js has finished
+  // reading any sign-in result from the URL.
+  cleanAuthUrl();
   if (!session) {
     eventId = null;
     currentEvent = null;
     events = [];
     roster = [];
     sessionUserId = null;
+    document.getElementById("session-email").textContent = "";
+    resetGoogleButton();
     showAuth();
     return;
   }
@@ -612,3 +705,5 @@ supabase.auth.onAuthStateChange((_event, session) => {
   sessionUserId = session.user.id;
   startSession(session);
 });
+
+if (oauthError) setAuthError(`Google sign-in didn't finish: ${oauthError}`);

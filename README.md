@@ -15,11 +15,17 @@ npm run dev
 
 Open http://localhost:5173 and sign in with an **organizer** account (`event_roles.role = 'organizer'`).
 
+## Signing in
+
+Organizers can use **Sign in with Google** (the same Google sign-in as the DataHacks site) or an email and password. Either way, the account needs an `organizer` row in `event_roles`; anyone else is signed out on that device with "This Google account isn't an organizer."
+
+Google sends people back to the page they started on, so that URL has to be in Supabase's **Redirect URLs** (Authentication → URL Configuration), for example `https://datahacks-check-in.vercel.app/**`, `https://datahacks-check-in-*-datahacks.vercel.app/**` for Vercel previews and `http://localhost:5173/**` for `npm run dev`. A URL that isn't allowed falls back to the Site URL.
+
 ## Choosing the event
 
 After sign-in the app lists every event you are an organizer of (`event_roles` joined to `events`, events with a `code` only) and shows the one you're checking into in the header and above the scanner. It defaults to the last event you picked on that device (localStorage), otherwise the newest event (`starts_at`, latest first). Switching asks for confirmation; every check-in, undo, roster tab, CSV export and live update then uses the selected event.
 
-If your organizer events can't be loaded, the app falls back to `VITE_EVENT_ID` (if set) or the newest event with a code, and marks the banner as a fallback.
+If your organizer events can't be loaded (the query fails), the app falls back to `VITE_EVENT_ID` (if set) or the newest event with a code, and marks the banner as a fallback.
 
 To check people into an event, your account needs an organizer row for it, for example:
 
