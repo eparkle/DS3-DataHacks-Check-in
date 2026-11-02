@@ -12,12 +12,13 @@ const ready = prepareZXingModule({
   fireImmediately: true,
 });
 
-// Live video: one QR per frame, no rotation/inversion passes. The next frame
-// is ~40ms away, so a fast miss beats a slow, thorough pass.
+// Live video: one QR per frame. tryHarder stays on (about 1ms more per
+// 1280x720 frame, better on blurry or angled codes); rotation passes are
+// pointless for QR and inverted (light-on-dark) passes aren't needed.
 const OPTIONS = {
   formats: ["QRCode"],
   maxNumberOfSymbols: 1,
-  tryHarder: false,
+  tryHarder: true,
   tryRotate: false,
   tryInvert: false,
 };

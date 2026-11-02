@@ -29,7 +29,7 @@ function describeCameraError(err) {
     return new CameraError(
       "denied",
       ios
-        ? "Camera access is blocked. Allow camera access in Settings → Safari → Camera (or tap “aA” → Website Settings → Camera → Allow), then tap Retry."
+        ? "Camera access is blocked. Allow camera access in Settings → Safari → Camera (or “aA” → Website Settings → Camera → Allow), then tap Retry. If it still fails, reload the page."
         : "Camera access is blocked. Allow the camera for this site (lock icon in the address bar → Camera → Allow), then tap Retry."
     );
   }
@@ -227,6 +227,7 @@ export class QrScanner {
     this.stream = null;
     this.decoder = null;
     this.running = false;
+    this.starting = false;
     this.busy = false;
     this.rafId = 0;
     this.lastDecodeAt = 0;
@@ -238,13 +239,23 @@ export class QrScanner {
     this.tick = this.tick.bind(this);
   }
 
+  // Starting, or holding the camera.
   get active() {
-    return this.running || !!this.stream;
+    return this.starting || this.running || !!this.stream;
   }
 
   async start() {
     if (this.active) return;
     const session = ++this.session;
+    this.starting = true;
+    try {
+      await this.open(session);
+    } finally {
+      if (session === this.session) this.starting = false;
+    }
+  }
+
+  async open(session) {
     this.onState("starting");
     performance.mark("scanner:start");
 
@@ -305,6 +316,7 @@ export class QrScanner {
 
   stop() {
     this.session++;
+    this.starting = false;
     this.running = false;
     cancelAnimationFrame(this.rafId);
     this.rafId = 0;

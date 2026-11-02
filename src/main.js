@@ -584,8 +584,10 @@ function setScannerState(state, detail) {
   const live = state === "starting" || state === "scanning";
   startBtn.disabled = live;
   stopBtn.disabled = !live && !cameraWanted;
-  if (state === "error") cameraWanted = false;
-  if (state === "error") stopBtn.disabled = true;
+  if (state === "error") {
+    cameraWanted = false;
+    stopBtn.disabled = true;
+  }
 }
 
 function getScanner() {
