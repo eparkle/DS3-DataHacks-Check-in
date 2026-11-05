@@ -8,10 +8,14 @@
 //     check_in_by_code ("unknown", "dupe") is never queued.
 //   - The queue holds at most one waiting op per code (a check-in, or an undo
 //     of a server check-in); an undo of a queued check-in just removes it.
-//   - Items are sent one at a time, in order. check_in_by_code only updates a
-//     row whose checked_in_at is null, so a retry can never check someone in
-//     twice; a retry of a request that did land comes back as "dupe" with our
-//     own timestamp, which we recognise and treat as synced.
+//   - Items are sent one at a time, in order, each with its own client id
+//     (the item id) and the time it was scanned. The database remembers the
+//     client id, so a retry of a request that did land (we never saw the
+//     answer) comes back as the original "ok", not "already checked in"; and
+//     the check-in keeps the scan time, not the sync time.
+//   - A database without those parameters yet (the site's migration isn't on
+//     it) answers PGRST202; the call is repeated the old way and remembered
+//     for the session, so the app works before and after the migration.
 
 import { supabase } from "./supabase.js";
 import { kvGet, kvSet, kvDelete, kvDeletePrefix } from "./offline-store.js";
@@ -19,8 +23,6 @@ import { kvGet, kvSet, kvDelete, kvDeletePrefix } from "./offline-store.js";
 export const RPC_TIMEOUT_MS = 6000;
 const FLUSH_BASE_MS = 15000;
 const FLUSH_MAX_MS = 60000;
-// Phone vs database clock slack when matching a "dupe" to our own lost write.
-const CLOCK_SLACK_MS = 60000;
 
 // ---------- Network state ----------
 // navigator.onLine only knows about the Wi-Fi link; venue Wi-Fi is often
@@ -93,7 +95,28 @@ function classify(res, { sent }) {
   if (status >= 500 || status === 408) return { kind: "transient", reason: "server", maybeSent: true, message };
   if (status === 429) return { kind: "transient", reason: "server", maybeSent: false, message };
   if (status === 401 || JWT_CODES.has(error.code)) return { kind: "transient", reason: "auth", maybeSent: false, message };
-  return { kind: "error", message, status, code: error.code || "" };
+  return { kind: "error", message, status, code: error.code || "", hint: error.hint || "", detail: error.details || error.detail || "" };
+}
+
+// PostgREST couldn't find a function with these parameters (or the table):
+// the database is older than this app.
+export function isMissingApi(res) {
+  return res?.kind === "error" && (res.code === "PGRST202" || res.code === "PGRST205" || res.code === "42P01" || res.code === "42883" || res.status === 404);
+}
+
+// Functions the database only has in their old form (per session).
+const legacyRpc = new Set();
+export const isLegacyRpc = (name) => legacyRpc.has(name);
+
+// An RPC with new optional parameters: tries them, and on an older database
+// repeats the call with only the old ones (and remembers that).
+export async function callRpcCompat(name, args, legacyArgs, opts) {
+  if (!legacyRpc.has(name)) {
+    const res = await callRpc(name, args, opts);
+    if (!isMissingApi(res) || !legacyArgs) return res;
+    legacyRpc.add(name);
+  }
+  return legacyArgs ? callRpc(name, legacyArgs, opts) : { kind: "error", message: "Not available on this database", code: "PGRST202", status: 404 };
 }
 
 // Run a PostgREST builder (select or rpc) with a hard timeout. The timeout
@@ -185,11 +208,32 @@ export async function loadEventsCache(userId) {
   }
 }
 
+// Small per-organizer extras: scan types, who already had each meal, and
+// organizers' names ("by Evan"). key is e.g. "scantypes:<event>".
+export async function saveUserCache(userId, key, value) {
+  if (!userId) return;
+  try {
+    await kvSet(`x:${userId}:${key}`, value);
+  } catch {
+    /* ignore */
+  }
+}
+
+export async function loadUserCache(userId, key) {
+  if (!userId) return null;
+  try {
+    return (await kvGet(`x:${userId}:${key}`)) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 // Sign-out: forget this organizer's roster and events on this phone.
 export async function clearUserCache(userId) {
   if (!userId) return;
   try {
     await kvDeletePrefix(`roster:${userId}:`);
+    await kvDeletePrefix(`x:${userId}:`);
     await kvDelete(eventsKey(userId));
   } catch {
     /* ignore */
@@ -211,21 +255,27 @@ function uuid() {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 
-// Item: { id, op: "check_in" | "undo", eventId, code, name, roles, team,
+// Item: { id (also the client id the database dedupes on), op: "check_in" |
+//         "undo" | "scan", eventId, code, name, roles, team,
 //         at (client scan time), state: "pending" | "attention", attempts,
 //         unverified, error,
-//         landedFrom / landedTo: the window in which an earlier attempt may
-//           have reached the database even though we never got the answer,
+//         prevAt: (undo) the check-in time being undone,
+//         scanTypeId, label: (scan) which meal / swag,
 //         sendingAt: set while a request is out (survives a reload mid-send) }
 
-// Record that an attempt sent at `sentAt` may have landed.
-export function noteMaybeLanded(item, sentAt) {
-  const from = Date.parse(sentAt);
-  if (!from) return;
-  const to = from + RPC_TIMEOUT_MS;
-  item.landedFrom = item.landedFrom && Date.parse(item.landedFrom) < from ? item.landedFrom : new Date(from).toISOString();
-  item.landedTo = item.landedTo && Date.parse(item.landedTo) > to ? item.landedTo : new Date(to).toISOString();
+// The RPC call for a queued item: new parameters, plus the old form for an
+// older database (scans have none).
+export function rpcForItem(item) {
+  const base = { p_event_id: item.eventId, p_code: item.code };
+  if (item.op === "undo") {
+    return ["undo_check_in", { ...base, ...(item.prevAt ? { p_expected_checked_in_at: item.prevAt } : {}), p_source: "offline" }, base];
+  }
+  if (item.op === "scan") {
+    return ["record_scan", { ...base, p_scan_type_id: item.scanTypeId, p_scanned_at: item.at, p_client_id: item.id, p_source: "offline" }, null];
+  }
+  return ["check_in_by_code", { ...base, p_checked_in_at: item.at, p_client_id: item.id, p_source: "offline" }, base];
 }
+
 export class CheckinQueue {
   constructor() {
     this.userId = null;
@@ -268,10 +318,12 @@ export class CheckinQueue {
       const saved = await kvGet(queueKey(userId));
       if (this.userId !== userId) return;
       this.items = Array.isArray(saved) ? saved.filter((i) => i && i.id && i.code && i.op) : [];
-      // The page went away while a request was out: it may have landed.
+      // The page went away while a request was out: it may have landed; the
+      // retry carries the same client id, so the database won't do it twice.
       this.items.forEach((i) => {
-        if (i.sendingAt) noteMaybeLanded(i, i.sendingAt);
         delete i.sendingAt;
+        delete i.landedFrom;
+        delete i.landedTo;
       });
     } catch {
       this.items = [];
@@ -319,13 +371,18 @@ export class CheckinQueue {
     return this.items.find((i) => i.eventId === eventId && i.code === code && i.state === "pending" && i.id !== this.inFlight) || null;
   }
 
-  // Any pending op for a code, including the one being sent right now.
+  // Any pending check-in / undo for a code, including the one being sent right now.
   latestFor(eventId, code) {
     for (let k = this.items.length - 1; k >= 0; k--) {
       const i = this.items[k];
-      if (i.eventId === eventId && i.code === code && i.state === "pending") return i;
+      if (i.eventId === eventId && i.code === code && i.state === "pending" && i.op !== "scan") return i;
     }
     return null;
+  }
+
+  // A meal / swag scan of this code for this scan type saved on this phone.
+  scanFor(eventId, code, scanTypeId) {
+    return this.items.find((i) => i.op === "scan" && i.eventId === eventId && i.code === code && i.scanTypeId === scanTypeId) || null;
   }
 
   async add(fields) {
@@ -418,21 +475,17 @@ export class CheckinQueue {
         const item = this.items.find((i) => i.state === "pending");
         if (!item) break;
         this.inFlight = item.id;
-        const sentAt = new Date().toISOString();
         item.attempts += 1;
-        item.sendingAt = sentAt;
+        item.sendingAt = new Date().toISOString();
         await this.persist();
 
-        const result = await callRpc(item.op === "undo" ? "undo_check_in" : "check_in_by_code", {
-          p_event_id: item.eventId,
-          p_code: item.code,
-        });
+        const [fn, args, legacyArgs] = rpcForItem(item);
+        const result = await callRpcCompat(fn, args, legacyArgs);
         this.inFlight = null;
         delete item.sendingAt;
         if (this.userId !== userId) return;
 
         if (result.kind === "transient") {
-          if (result.maybeSent) noteMaybeLanded(item, sentAt);
           this.lastError = result.message;
           await this.persist();
           stoppedEarly = true;
@@ -445,12 +498,7 @@ export class CheckinQueue {
         const outcome = this.outcomeFor(item, result);
         if (outcome === "attention") {
           item.state = "attention";
-          item.error =
-            result.kind === "error"
-              ? result.message
-              : result.data?.status === "unknown"
-                ? "Not on the roster"
-                : `Unexpected answer: ${JSON.stringify(result.data)}`;
+          item.error = attentionText(item, result);
         } else {
           this.items = this.items.filter((i) => i.id !== item.id);
           synced += 1;
@@ -485,19 +533,35 @@ export class CheckinQueue {
       // ok, or not_checked_in (someone already undid it): either way, done.
       return status === "ok" || status === "not_checked_in" ? "undone" : "attention";
     }
-    if (status === "ok") return "synced";
-    if (status === "dupe") {
-      // Did an earlier attempt of ours land (we never saw the answer)? Then
-      // the database's time falls inside that attempt's window. (This
-      // attempt can't be it: it would have said "ok".)
-      const at = Date.parse(result.data.checked_in_at || "");
-      const from = Date.parse(item.landedFrom || "");
-      const to = Date.parse(item.landedTo || "");
-      if (at && from && to && at >= from - CLOCK_SLACK_MS && at <= to + CLOCK_SLACK_MS) return "synced";
-      return "already";
+    if (item.op === "scan") {
+      if (status === "ok" || status === "not_checked_in") return "synced";
+      return status === "already" ? "already" : "attention";
     }
+    // ok includes a replay of our own earlier attempt (same client id).
+    if (status === "ok") return "synced";
+    if (status === "dupe") return "already";
     return "attention";
   }
 }
 
+// What the sheet says about an item the server wouldn't take.
+export function attentionText(item, result) {
+  if (result.kind === "error") {
+    if (result.hint === "checkin_changed") {
+      const at = result.detail ? new Date(result.detail) : null;
+      const when = at && !Number.isNaN(at.getTime()) ? ` at ${at.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : "";
+      return `Checked in again${when}, so the undo wasn't applied`;
+    }
+    if (result.hint === "no_show") return "Marked a no-show: look them up online to let them in";
+    if (item.op === "scan" && isMissingApi(result)) return "This database can't record meal or swag scans yet";
+    return result.message;
+  }
+  const status = result.data?.status;
+  if (status === "unknown" || status === "not_on_roster") return "Not on the roster";
+  return `Unexpected answer: ${JSON.stringify(result.data)}`;
+}
+
 export const queue = new CheckinQueue();
+
+// A fresh id for a write (the database dedupes retries on it).
+export const newClientId = () => uuid();

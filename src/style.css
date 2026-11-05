@@ -1053,3 +1053,89 @@ button.row-checkin{ min-width:100px; height:var(--tap); padding:0 16px; font-siz
   .ws-card{ gap:9px; padding:14px 14px 14px; }
   .ws-lead{ font-size:13px; }
 }
+
+/* ==========================================================================
+   Scan modes: Check-in (default) or a meal / swag scan type. The mode chip
+   sits on the camera's top-left corner (camera on or off); a scan mode turns
+   the chip, the camera edge and the result card indigo, so a lunch scan can't
+   be mistaken for a check-in.
+   ========================================================================== */
+:root{
+  --scan:#b4bcff;        /* indigo text on dark glass */
+  --scan-band:#4338ca;   /* indigo band / chip (white text 7.9:1) */
+  --scan-ring:rgb(129 140 248 / .8);
+}
+.mode-chip{
+  position:absolute; z-index:8; top:10px; left:10px; max-width:calc(100% - 170px); min-width:0;
+  height:36px; display:inline-flex; align-items:center; gap:7px; padding:0 10px 0 12px;
+  background:rgb(14 7 28 / .78); color:var(--text);
+  border:1px solid rgb(255 255 255 / .2); border-radius:var(--radius-pill);
+  box-shadow:inset 0 1px 0 rgb(255 255 255 / .22);
+  font:400 10px/1 var(--font-display); letter-spacing:.06em; text-transform:uppercase;
+}
+.mode-chip[hidden]{ display:none; }
+.mode-chip:focus-within{ outline:2px solid var(--focus); outline-offset:2px; }
+.mode-dot{ flex:none; width:8px; height:8px; border-radius:2px; background:var(--pearl); }
+#reader-frame[data-state="scanning"] .mode-dot{ background:var(--success); box-shadow:0 0 8px rgb(78 224 138 / .8); }
+.mode-label{ min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.mode-caret{ flex:none; color:var(--muted); }
+.mode-chip select{
+  position:absolute; inset:0; width:100%; height:100%; opacity:0; cursor:pointer;
+  font-size:16px; /* no iOS zoom */ border:0; appearance:none; -webkit-appearance:none;
+}
+/* With the mode chip, it carries the live dot: the separate live pill goes. */
+#reader-frame.has-modes .live-pill{ display:none; }
+.cam-btns{ margin-left:auto; }
+/* A scan mode: indigo everywhere it shows. */
+#reader-frame[data-mode="scan"] .mode-chip{ background:var(--scan-band); border-color:rgb(255 255 255 / .35); color:#fff; }
+#reader-frame[data-mode="scan"] .mode-caret{ color:rgb(255 255 255 / .85); }
+#reader-frame[data-mode="scan"]{ border:2px solid var(--scan-ring); }
+#reader-frame[data-mode="scan"] .corners span{ border-color:var(--scan); }
+#reader-frame[data-flash="scan"]{ --flash-ring:rgb(129 140 248 / .7); --flash-haze:rgb(99 102 241 / .3); }
+#reader-frame[data-mode="scan"] #scanner-overlay::before{ filter:hue-rotate(80deg) saturate(1.4); }
+.scan-panel[data-mode="scan"] #manual-btn{
+  color:#fff; background:linear-gradient(180deg, #5b55e0, var(--scan-band) 60%, #3b31b8);
+}
+
+/* Result card in a scan mode: indigo band for "recorded", indigo edge always. */
+#status-card.scan .band{ background:var(--scan-band); }
+#status-card.mode-scan{ box-shadow:inset 0 0 0 2px var(--scan-band), inset 0 1px 0 rgb(255 255 255 / .9), var(--shadow); }
+#status-card .walkin-btn{ background:#f5c451; color:#3a2200; border-color:#b9821c; box-shadow:inset 0 1px 0 rgb(255 255 255 / .55); }
+
+/* ID check line on a fresh check-in: "18+" / "Check ID · age unknown" /
+   "Under 18", then school or organization. Fits the same card height. */
+#status-card .idl{
+  margin-top:3px; display:flex; align-items:center; gap:6px; min-width:0;
+  font:500 12.5px/1.2 var(--font-ui); color:var(--ink-muted);
+}
+#status-card .idl .age{
+  flex:none; height:18px; padding:0 6px; display:inline-flex; align-items:center;
+  border-radius:6px; font:700 11.5px/1 var(--font-ui); white-space:nowrap;
+}
+#status-card .age-ok{ background:#17663a; color:#fff; }
+#status-card .age-unk{ background:#f5c451; color:#3a2200; box-shadow:inset 0 0 0 1px #b9821c; }
+#status-card .age-under{ background:#a8302a; color:#fff; }
+#status-card .idl .aff{ min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+#status-card .body.has-id .name{ font-size:17.5px; line-height:1.1; }
+#status-card .body.has-id .meta{ margin-top:2px; }
+#status-card .body.has-id .wv-btn{ height:21px; }
+@media (max-height: 700px){
+  #status-card:has(.has-id) .band{ height:26px; }
+  #status-card .body.has-id .name{ font-size:17px; }
+  #status-card .body.has-id .wv-btn{ height:20px; }
+  #status-card .idl{ margin-top:2px; }
+  #status-card .idl .age{ height:17px; }
+}
+
+/* Recent rows for scans: the scan type, then the time, in indigo. */
+.recent-row.is-mode{ box-shadow:inset 3px 0 0 var(--scan-band), inset 0 1px 0 rgb(255 255 255 / .14), inset 0 0 0 1px rgb(255 255 255 / .07); }
+.recent-row .mt{
+  flex:0 1 auto; min-width:0; max-width:34%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  font:600 11.5px/1 var(--font-ui); color:var(--scan);
+}
+.recent-row.is-scan .t{ color:var(--scan); }
+#reader-frame[data-mode="scan"]:not([data-state="scanning"]) .mode-dot{ background:#fff; }
+/* The reason the server gave is the point of an attention row: let it wrap,
+   with the buttons on their own line on narrow phones. */
+.sheet-row.is-attention .sheet-main{ flex:1 1 170px; }
+.sheet-row.is-attention .sheet-sub{ white-space:normal; overflow-wrap:anywhere; }
