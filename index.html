@@ -53,6 +53,7 @@
       <h1>Check-In</h1>
     </div>
     <span class="session-email" id="session-email"></span>
+    <button class="sync-pill" id="sync-pill" type="button" aria-haspopup="dialog" aria-controls="sync-sheet" hidden></button>
     <div class="event-chip" title="Every check-in, undo and roster on this page uses this event">
       <span class="event-chip-dot" aria-hidden="true"></span>
       <span class="event-chip-code current-event-code" aria-hidden="true">—</span>
@@ -137,6 +138,20 @@
 
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <dialog class="sync-sheet" id="sync-sheet" aria-labelledby="sync-sheet-title">
+    <div class="sheet-panel">
+      <div class="sheet-head">
+        <h2 id="sync-sheet-title">Saved on this phone</h2>
+        <button class="icon-btn sheet-close" type="button" data-close aria-label="Close">
+          <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+      <p class="sheet-status" id="sync-sheet-status" role="status"></p>
+      <ul class="sheet-list" id="sync-sheet-list" hidden></ul>
+      <button class="primary sheet-sync" id="sync-now-btn" type="button" hidden>Sync now</button>
+    </div>
+  </dialog>
 </div>
 
 <script type="module" src="/src/main.js"></script>
