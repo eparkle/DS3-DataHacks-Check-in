@@ -66,6 +66,26 @@
     </button>
   </header>
 
+  <nav class="tabs glass" aria-label="Sections" style="--tab-i:0">
+    <span class="tab-pill" aria-hidden="true"></span>
+    <button class="tab-btn active" data-view="scan" type="button" aria-current="page">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 8V3h5M16 3h5v5M21 16v5h-5M8 21H3v-5M7 12h10" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square"/></svg>
+      <span>Scan</span>
+    </button>
+    <button class="tab-btn" data-view="hacker" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3h8v8H8zM5 13h14v8H5z" fill="currentColor"/></svg>
+      <span>Hackers</span>
+    </button>
+    <button class="tab-btn" data-view="judge" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 2h2v2h-2zM4 5h16v2H4zM5 9h2v6H5zM3 15h6v2H3zM17 9h2v6h-2zM15 15h6v2h-6zM11 7h2v12h-2zM7 19h10v2H7z" fill="currentColor"/></svg>
+      <span>Judges</span>
+    </button>
+    <button class="tab-btn" data-view="mentor" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 3h16v4H4zM6 7h12v6H6zM10 13h4v4h-4zM7 17h10v4H7z" fill="currentColor"/></svg>
+      <span>Mentors</span>
+    </button>
+  </nav>
+
   <main class="views">
     <section class="view active" id="view-scan" aria-label="Scan">
       <div class="scan-panel">
@@ -94,13 +114,13 @@
             <button class="primary" id="scanner-retry" type="button" hidden>Retry</button>
           </div>
         </div>
-        <div id="status-card" class="info" aria-live="polite"></div>
         <form class="manual" id="manual-form" autocomplete="off">
           <label class="visually-hidden" for="manual-input">Attendee code or email</label>
           <input id="manual-input" type="text" placeholder="Code or email" enterkeyhint="go"
                  autocapitalize="off" autocorrect="off" spellcheck="false">
           <button class="primary" id="manual-btn" type="submit">Check in</button>
         </form>
+        <div id="status-card" class="info" aria-live="polite"></div>
         <div class="recent" id="recent">
           <div class="recent-inner">
             <h2 class="section-label" id="recent-label">Recent</h2>
@@ -115,25 +135,6 @@
     <section class="view" id="view-mentor" data-role="mentor" aria-label="Mentors"></section>
   </main>
 
-  <nav class="tabs glass" aria-label="Sections" style="--tab-i:0">
-    <span class="tab-pill" aria-hidden="true"></span>
-    <button class="tab-btn active" data-view="scan" type="button" aria-current="page">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 8V3h5M16 3h5v5M21 16v5h-5M8 21H3v-5M7 12h10" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="square"/></svg>
-      <span>Scan</span>
-    </button>
-    <button class="tab-btn" data-view="hacker" type="button">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3h8v8H8zM5 13h14v8H5z" fill="currentColor"/></svg>
-      <span>Hackers</span>
-    </button>
-    <button class="tab-btn" data-view="judge" type="button">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 2h2v2h-2zM4 5h16v2H4zM5 9h2v6H5zM3 15h6v2H3zM17 9h2v6h-2zM15 15h6v2h-6zM11 7h2v12h-2zM7 19h10v2H7z" fill="currentColor"/></svg>
-      <span>Judges</span>
-    </button>
-    <button class="tab-btn" data-view="mentor" type="button">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 3h16v4H4zM6 7h12v6H6zM10 13h4v4h-4zM7 17h10v4H7z" fill="currentColor"/></svg>
-      <span>Mentors</span>
-    </button>
-  </nav>
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 </div>
