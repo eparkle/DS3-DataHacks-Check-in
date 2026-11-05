@@ -652,7 +652,9 @@ document.getElementById("google-btn").addEventListener("click", async () => {
   document.getElementById("google-btn-label").textContent = "Opening Google…";
   const { error } = await supabase.auth.signInWithOAuth({
     provider: "google",
-    options: { redirectTo: window.location.origin + window.location.pathname },
+    // Always show Google's account picker: phones are often signed in to a
+    // personal Google account, which isn't an organizer.
+    options: { redirectTo: window.location.origin + window.location.pathname, queryParams: { prompt: "select_account" } },
   });
   // On success the browser is already leaving for Google.
   if (error) {
