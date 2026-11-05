@@ -1,6 +1,7 @@
 import { supabase } from "./supabase.js";
 import { QrScanner, prewarm as prewarmScanner } from "./scanner.js";
 import { feedback, unlockAudio, isMuted, setMuted } from "./feedback.js";
+import { searchIndex, searchPeople, compareAZ, compareNewestIn, VirtualList, LetterIndex } from "./roster.js";
 import "./style.css";
 
 // ---------- Phone shell: no page zoom, no page scroll ----------
@@ -38,10 +39,11 @@ const ROLES = ["hacker", "judge", "mentor"];
 const ROLE_LABELS = { hacker: "Hackers", judge: "Judges", mentor: "Mentors" };
 const ROLE_SINGULAR = { hacker: "Hacker", judge: "Judge", mentor: "Mentor" };
 const RECENT_MAX = 6;
+// Not yet first: the desk's job is the people who haven't arrived.
 const STATUS_FILTERS = [
-  ["all", "All"],
   ["out", "Not yet"],
   ["in", "Checked in"],
+  ["all", "All"],
 ];
 // Only used when the organizer's events can't be loaded from event_roles.
 const FALLBACK_EVENT_ID = (import.meta.env.VITE_EVENT_ID || "").trim();
@@ -50,9 +52,11 @@ const NOT_ORGANIZER_MESSAGE = "This Google account isn't an organizer. Ask a Dat
 const NOT_ORGANIZER_PASSWORD_MESSAGE = "This account isn't an organizer. Ask a DataHacks organizer to add you.";
 
 let roster = [];
+// code -> person, rebuilt with the roster.
+let rosterByCode = new Map();
 // True while the roster for the selected event is being fetched (first load, event switch).
 let rosterLoading = true;
-const statusFilter = { hacker: "all", judge: "all", mentor: "all" };
+const statusFilter = { hacker: "out", judge: "out", mentor: "out" };
 let eventId = null;
 let currentEvent = null;
 let events = [];
@@ -195,7 +199,7 @@ function showApp() {
 
 function normalizeRow(row) {
   const roles = Array.isArray(row.roles) ? row.roles : [];
-  return {
+  const person = {
     id: row.id,
     code: (row.code || "").toUpperCase(),
     name: row.name || row.email || row.code,
@@ -206,6 +210,23 @@ function normalizeRow(row) {
     checked_in_at: row.checked_in_at,
     at: formatTime(row.checked_in_at),
   };
+  person.search = searchIndex(person);
+  return person;
+}
+
+function setRoster(rows) {
+  roster = rows;
+  rosterByCode = new Map(roster.map((p) => [p.code, p]));
+}
+
+// Apply a check-in or undo locally so the list updates at once; the
+// background reload (and realtime) reconcile with the database.
+function patchPerson(code, checkedInAt) {
+  const p = rosterByCode.get(String(code || "").toUpperCase());
+  if (!p) return;
+  p.checked_in = !!checkedInAt;
+  p.checked_in_at = checkedInAt || null;
+  p.at = formatTime(checkedInAt);
 }
 
 function readStoredEventId(userId) {
@@ -346,7 +367,7 @@ async function switchEvent(nextId) {
   currentEvent = next;
   eventId = next.id;
   storeEventId(sessionUserId, next.id);
-  roster = [];
+  setRoster([]);
   rosterLoading = true;
   lastScanId = null;
   currentScan = null;
@@ -381,18 +402,73 @@ async function loadRoster() {
   if (error) throw error;
   // The organizer switched events while this was in flight.
   if (requestedEventId !== eventId) return;
-  roster = (data || []).map(normalizeRow);
+  setRoster((data || []).map(normalizeRow));
   rosterLoading = false;
   renderActiveRoleView();
   renderRecent();
 }
 
-function renderActiveRoleView() {
+// One roster fetch at a time; calls while one is in flight run once after it.
+let rosterRequest = null;
+let rosterAgain = false;
+function reloadRoster() {
+  if (rosterRequest) {
+    rosterAgain = true;
+    return rosterRequest;
+  }
+  rosterRequest = loadRoster()
+    .catch((err) => console.error(err))
+    .finally(() => {
+      rosterRequest = null;
+      if (rosterAgain) {
+        rosterAgain = false;
+        reloadRoster();
+      }
+    });
+  return rosterRequest;
+}
+let reloadTimer = null;
+function scheduleReload(delay = 400) {
+  clearTimeout(reloadTimer);
+  reloadTimer = setTimeout(reloadRoster, delay);
+}
+
+function renderActiveRoleView(opts) {
   ROLES.forEach((role) => {
     if (document.getElementById("view-" + role).classList.contains("active")) {
-      renderRoleView(role);
+      renderRoleView(role, opts);
     }
   });
+}
+
+let renderFrame = 0;
+function scheduleRosterRender() {
+  if (renderFrame) return;
+  renderFrame = requestAnimationFrame(() => {
+    renderFrame = 0;
+    renderActiveRoleView();
+    renderRecent();
+  });
+}
+
+// A change from another desk: update that one person in place (no refetch of
+// the whole roster). Anything unexpected falls back to a reload.
+function applyRealtime(payload) {
+  const type = payload?.eventType;
+  const row = payload?.new;
+  if ((type === "INSERT" || type === "UPDATE") && row?.id && row.code && row.event_id === eventId) {
+    const next = normalizeRow(row);
+    const i = roster.findIndex((p) => p.id === next.id);
+    if (i >= 0) roster[i] = next;
+    else roster.push(next);
+    setRoster(roster);
+    scheduleRosterRender();
+  } else if (type === "DELETE" && payload.old?.id) {
+    setRoster(roster.filter((p) => p.id !== payload.old.id));
+    scheduleRosterRender();
+  } else {
+    scheduleReload();
+  }
 }
 
 async function subscribeAttendees() {
@@ -410,9 +486,7 @@ async function subscribeAttendees() {
         table: "attendees",
         filter: `event_id=eq.${eventId}`,
       },
-      () => {
-        loadRoster().catch((err) => console.error(err));
-      }
+      (payload) => applyRealtime(payload)
     )
     .subscribe();
 }
@@ -423,7 +497,7 @@ function resolveCode(raw) {
   const upper = trimmed.toUpperCase();
   const lower = trimmed.toLowerCase();
   const match =
-    roster.find((p) => p.code === upper) ||
+    rosterByCode.get(upper) ||
     roster.find((p) => (p.email || "").toLowerCase() === lower) ||
     roster.find((p) => (p.name || "").toLowerCase() === lower);
   return match ? match.code : upper;
@@ -510,7 +584,7 @@ function renderRecent() {
   document.getElementById("recent").classList.toggle("empty", !recentScans.length);
   list.innerHTML = recentScans
     .map((scan) => {
-      const person = roster.find((p) => p.code === scan.code);
+      const person = rosterByCode.get(scan.code);
       const undone = scan.kind !== "error" && person && !person.checked_in;
       const kind = undone ? "undone" : scan.kind;
       const status =
@@ -603,11 +677,8 @@ async function processCode(rawText) {
     announce("error");
   }
 
-  try {
-    await loadRoster();
-  } catch (err) {
-    console.error(err);
-  }
+  if (status === "ok" || status === "dupe") patchPerson(base.code, data.checked_in_at || scannedAt.toISOString());
+  reloadRoster();
   return data || {};
 }
 
@@ -624,138 +695,266 @@ async function undoCode(code) {
     // An undone scan doesn't belong in the recent list.
     if (currentScan?.code === data.code) currentScan = null;
     setInfo(`Undid check-in for ${data.name || data.code}.`, "Undone");
+    patchPerson(data.code || code, null);
+    renderRecent();
   }
-  try {
-    await loadRoster();
-  } catch (err) {
-    console.error(err);
-  }
+  reloadRoster();
   return data || {};
 }
 
-// Not yet first (what the desk still has to do), then checked in; A–Z inside each group.
-function compareByName(a, b) {
-  return a.name.localeCompare(b.name, undefined, { sensitivity: "base" }) || a.code.localeCompare(b.code);
-}
+// ---------- Roster tabs ----------
+// Search first; below it Not yet (default) · Checked in · All. A–Z views are
+// grouped by letter with a pinned header and an A–Z index on the right edge.
+// The list is virtualized: only the rows on screen exist in the DOM.
 
-function personRow(p, role) {
+// person id -> "checking" | "done" | "leaving" while a roster check-in plays out.
+const rowState = new Map();
+const rosterUI = {};
+
+function roleLabelFor(p, role) {
   const otherRoles = roleList(p).filter((r) => r !== role && ROLE_SINGULAR[r]);
-  // Mentors and judges show their role label (e.g. "Mentor + Judge" for a B code).
-  const roleLabel =
-    role === "hacker" && !otherRoles.length
-      ? ""
-      : [role, ...otherRoles].map((r) => ROLE_SINGULAR[r]).join(" + ");
-  const details = [p.team, roleLabel].filter(Boolean);
-  const action = p.checked_in
-    ? `<span class="in-time"><span aria-hidden="true">✓</span><span class="visually-hidden">Checked in</span>${p.at ? ` ${escapeHtml(formatTimeShort(p.checked_in_at))}` : ""}</span>
-       <button class="row-undo" type="button" data-undo="${escapeHtml(p.code)}" aria-label="Undo check-in for ${escapeHtml(p.name)}">Undo</button>`
-    : `<span class="visually-hidden">Not checked in yet.</span>
-       <button class="primary row-checkin" type="button" data-code="${escapeHtml(p.code)}" aria-label="Check in ${escapeHtml(p.name)}">Check in</button>`;
-  return `
-    <li class="person ${p.checked_in ? "is-in" : "is-out"}">
-      <div class="person-main">
-        <div class="person-name">${escapeHtml(p.name)}</div>
-        <div class="person-sub"><code title="${escapeHtml(p.code)}">${escapeHtml(shortCode(p.code))}</code>${details.map((d) => `<span>${escapeHtml(d)}</span>`).join("")}</div>
-      </div>
-      <div class="person-action">${action}</div>
-    </li>`;
+  if (role === "hacker" && !otherRoles.length) return "";
+  return [role, ...otherRoles].map((r) => ROLE_SINGULAR[r]).join(" + ");
 }
 
-function renderRoleView(role) {
-  const all = roster.filter((r) => roleList(r).includes(role));
-  const searchEl = document.getElementById(`${role}-search`);
-  const search = (searchEl?.value || "").trim().toLowerCase();
+function rowSignature(it) {
+  const p = it.person;
+  return `${p.id}|${p.name}|${p.team}|${p.checked_in_at || ""}|${rowState.get(p.id) || ""}`;
+}
+
+function renderPersonRow(el, it, role) {
+  const p = it.person;
+  const state = rowState.get(p.id);
+  const isIn = p.checked_in && state !== "checking";
+  const details = [role === "hacker" ? p.team : "", roleLabelFor(p, role)].filter(Boolean);
+  const time = formatTimeShort(p.checked_in_at);
+  let action;
+  if (state === "checking") {
+    action = `<button class="primary row-checkin" type="button" disabled>Checking…</button>`;
+  } else if (isIn && (state === "done" || state === "leaving")) {
+    action = `<span class="in-badge"><span aria-hidden="true">✓</span> Checked in</span>`;
+  } else if (isIn) {
+    action = `<span class="in-time" title="Checked in ${escapeHtml(p.checked_in_at ? new Date(p.checked_in_at).toLocaleString() : "")}"><span aria-hidden="true">✓</span><span class="visually-hidden">Checked in at</span> ${escapeHtml(time || "")}</span>
+       <button class="row-undo" type="button" data-undo="${escapeHtml(p.code)}" aria-label="Undo check-in for ${escapeHtml(p.name)}">Undo</button>`;
+  } else {
+    action = `<button class="primary row-checkin" type="button" data-code="${escapeHtml(p.code)}" aria-label="Check in ${escapeHtml(p.name)}">Check in</button>`;
+  }
+  el.className = `person ${isIn ? "is-in" : "is-out"}${state ? ` is-${state}` : ""}`;
+  el.setAttribute("role", "listitem");
+  el.innerHTML = `
+    <div class="person-main">
+      <div class="person-name" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</div>
+      <div class="person-sub"><code title="${escapeHtml(p.code)}">${escapeHtml(shortCode(p.code))}</code>${details.map((d) => `<span>${escapeHtml(d)}</span>`).join("")}</div>
+    </div>
+    <div class="person-action">${action}</div>`;
+}
+
+function renderHeadRow(el, it) {
+  el.className = "vhead";
+  el.setAttribute("aria-hidden", "true");
+  el.innerHTML = `<span>${it.letter}</span>`;
+}
+
+function rolePeople(role) {
+  return roster.filter((r) => roleList(r).includes(role));
+}
+
+function showStatic(ui, html) {
+  ui.list.setItems([], { keepAnchor: false });
+  ui.staticEl.innerHTML = html;
+  ui.staticEl.hidden = false;
+  ui.wrap.classList.remove("has-index");
+  ui.sticky.hidden = true;
+  ui.mode = null;
+}
+
+function emptyState(title, detail = "", button = "") {
+  return `<div class="empty-state"><span class="empty-glyph" aria-hidden="true"></span><b>${title}</b>${detail ? `<span>${detail}</span>` : ""}${button}</div>`;
+}
+
+// The A–Z index only helps on a long, unfiltered A–Z list with room to drag.
+function syncLetterIndex(role) {
+  const ui = rosterUI[role];
+  const h = ui.scroller.clientHeight;
+  const show = ui.grouped && !ui.search.value.trim() && document.activeElement !== ui.search && ui.list.total > h * 2.5 && h >= 27 * 11;
+  ui.wrap.classList.toggle("has-index", show);
+  if (show) {
+    const head = ui.list.currentHead();
+    ui.index.setCurrent(head == null ? null : ui.list.items[ui.list.headIdx[head]].letter);
+  }
+}
+
+function renderRoleView(role, { animate = false, restore = false } = {}) {
+  const ui = rosterUI[role];
   const filter = statusFilter[role];
+  const query = ui.search.value.trim();
   const label = ROLE_LABELS[role].toLowerCase();
 
-  document.querySelectorAll(`#view-${role} .chip`).forEach((chip) => {
+  ui.view.querySelectorAll(".chip").forEach((chip) => {
     const active = chip.dataset.filter === filter;
-    chip.classList.toggle("active", active);
-    chip.setAttribute("aria-pressed", String(active));
+    chip.classList.toggle("active", active && !query);
+    chip.setAttribute("aria-pressed", String(active && !query));
   });
-  document.getElementById(`${role}-search-clear`).hidden = !search;
-
-  const list = document.getElementById(`${role}-list`);
-  list.setAttribute("aria-busy", String(rosterLoading));
+  ui.clear.hidden = !query;
+  ui.scroller.setAttribute("aria-busy", String(rosterLoading));
 
   if (rosterLoading) {
-    list.innerHTML = Array.from({ length: 6 }, () => `<li class="person skeleton" aria-hidden="true"><div></div><div></div></li>`).join("") +
-      `<li class="visually-hidden">Loading ${label}…</li>`;
+    showStatic(
+      ui,
+      Array.from({ length: 6 }, () => `<div class="person skeleton" aria-hidden="true"><div></div><div></div></div>`).join("") +
+        `<span class="visually-hidden">Loading ${label}…</span>`
+    );
     return;
   }
 
-  if (all.length === 0) {
-    list.innerHTML = `<li class="empty-state"><span class="empty-glyph" aria-hidden="true"></span><b>No ${label} on the ${escapeHtml(currentEvent?.code || "")} roster yet.</b><span>People appear here once their application is accepted.</span></li>`;
+  const all = rolePeople(role);
+  if (!all.length) {
+    showStatic(ui, emptyState(`No ${label} on the ${escapeHtml(currentEvent?.code || "")} roster yet.`, "People appear here once their application is accepted."));
     return;
   }
 
-  const matches = all.filter((p) => `${p.name} ${p.email || ""} ${p.code} ${p.team || ""}`.toLowerCase().includes(search));
-  const groups = [
-    { key: "out", title: "Not yet", people: matches.filter((p) => !p.checked_in).sort(compareByName) },
-    { key: "in", title: "Checked in", people: matches.filter((p) => p.checked_in).sort(compareByName) },
-  ].filter((g) => (filter === "all" || filter === g.key) && g.people.length);
+  let people;
+  let grouped = false;
+  if (query) {
+    people = searchPeople(all, query);
+  } else if (filter === "in") {
+    people = all.filter((p) => p.checked_in).sort(compareNewestIn);
+  } else {
+    // A row stays in Not yet while its check-in plays out, then slides away.
+    people = (filter === "out" ? all.filter((p) => !p.checked_in || rowState.has(p.id)) : all).sort(compareAZ);
+    // Letter groups only pay off on a long list; ~20 mentors read better plain.
+    grouped = people.length > 30;
+  }
 
-  if (!groups.length) {
-    const why = search
-      ? `No ${label} match “${escapeHtml(searchEl.value.trim())}”${filter === "all" ? "" : " in this filter"}.`
-      : filter === "in"
-        ? `No ${label} checked in yet.`
-        : `Everyone's checked in.`;
-    list.innerHTML = `<li class="empty-state"><span class="empty-glyph" aria-hidden="true"></span><b>${why}</b>${
-      search || filter !== "all" ? `<button class="ghost small" type="button" data-reset>Show all ${label}</button>` : ""
-    }</li>`;
+  if (!people.length) {
+    const html = query
+      ? emptyState(
+          `No ${label} match “${escapeHtml(query)}”`,
+          `Try the code on their pass, like <code>H042</code> or just <code>42</code>.`,
+          `<button class="ghost small" type="button" data-clear>Clear search</button>`
+        )
+      : filter === "out"
+        ? emptyState("Everyone's checked in.", `Every ${ROLE_SINGULAR[role].toLowerCase()} on the roster is here.`)
+        : emptyState(`No ${label} checked in yet.`, "Check-ins show up here, newest first.");
+    showStatic(ui, html);
     return;
   }
 
-  list.innerHTML = groups
-    .map(
-      (g) =>
-        `<li class="group-head" role="presentation">${g.title}</li>` +
-        g.people.map((p) => personRow(p, role)).join("")
-    )
-    .join("");
+  const items = [];
+  let letter = null;
+  for (const p of people) {
+    if (grouped && p.search.letter !== letter) {
+      letter = p.search.letter;
+      items.push({ key: `h:${letter}`, type: "head", letter });
+    }
+    items.push({ key: p.id, type: "row", person: p });
+  }
+
+  const mode = `${filter}|${query}`;
+  const modeChanged = ui.mode !== mode;
+  ui.mode = mode;
+  ui.grouped = grouped;
+  ui.staticEl.hidden = true;
+  ui.staticEl.innerHTML = "";
+  ui.scroller.dataset.mode = query ? "search" : filter;
+  ui.list.setItems(items, { grouped, animate: animate && !modeChanged, resetScroll: modeChanged && !restore });
+  if (restore && !modeChanged && ui.savedScroll) {
+    ui.scroller.scrollTop = ui.savedScroll;
+    ui.list.render();
+  }
+  if (grouped) ui.index.setLetters([...new Set(people.map((p) => p.search.letter))]);
+  syncLetterIndex(role);
 }
 
 let toastTimer = null;
-function toast(message, kind = "") {
+function toast(message, kind = "", action = null) {
   const el = document.getElementById("toast");
-  el.textContent = message;
-  el.className = `toast ${kind}`;
+  el.innerHTML = `<span class="toast-msg"></span>`;
+  el.firstChild.textContent = message;
+  if (action) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "toast-action";
+    btn.textContent = action.label;
+    btn.addEventListener("click", () => {
+      el.hidden = true;
+      action.run();
+    });
+    el.appendChild(btn);
+  }
+  el.className = `toast ${kind}${action ? " has-action" : ""}`;
   el.hidden = false;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
     el.hidden = true;
-  }, 3200);
+  }, action ? 5000 : 3200);
 }
 
-async function rosterCheckIn(btn) {
-  btn.disabled = true;
-  btn.textContent = "Checking…";
-  const result = await processCode(btn.dataset.code);
-  if (result?.status === "ok") toast(`Checked in ${result.name || result.code}`, "success");
-  else if (result?.status === "dupe") toast(`${result.name || result.code} was already checked in`, "warning");
-  else if (result?.status === "throttled") toast("Just checked that code. Give it a second.");
-  else toast(result?.message || "Check-in failed", "error");
-  // A successful check-in re-renders the list; otherwise restore the button.
-  if (btn.isConnected) {
-    btn.disabled = false;
-    btn.textContent = "Check in";
+function refreshRosterRows() {
+  ROLES.forEach((role) => rosterUI[role].list.refresh());
+}
+
+// Check in from the list: the row turns green for a moment, then leaves the
+// Not yet view; the toast offers Undo.
+async function rosterCheckIn(code) {
+  const p = rosterByCode.get(code);
+  if (!p || rowState.has(p.id)) return;
+  rowState.set(p.id, "checking");
+  refreshRosterRows();
+  const result = await processCode(code);
+  if (result?.status === "ok" || result?.status === "dupe") {
+    rowState.set(p.id, "done");
+    renderActiveRoleView();
+    if (result.status === "ok") {
+      toast(`Checked in ${result.name || p.name}`, "success", { label: "Undo", run: () => toastUndo(code) });
+    } else {
+      toast(`${result.name || p.name} was already checked in`, "warning");
+    }
+    setTimeout(() => {
+      if (rowState.get(p.id) !== "done") return;
+      rowState.set(p.id, "leaving");
+      refreshRosterRows();
+      setTimeout(() => {
+        if (rowState.get(p.id) !== "leaving") return;
+        rowState.delete(p.id);
+        renderActiveRoleView({ animate: true });
+      }, 240);
+    }, 650);
+    return;
   }
+  rowState.delete(p.id);
+  renderActiveRoleView();
+  if (result?.status === "throttled") toast("Just checked that code. Give it a second.");
+  else toast(result?.message || "Check-in failed", "error");
+}
+
+async function toastUndo(code) {
+  const p = rosterByCode.get(code);
+  if (p) rowState.delete(p.id);
+  // The same code can't go through processCode again for 3 s; undo resets that.
+  if (lastScanId === code) lastScanId = null;
+  const result = await undoCode(code);
+  renderActiveRoleView({ animate: true });
+  if (result?.status === "ok") toast(`Undid check-in for ${result.name || result.code}`);
+  else toast(result?.message || "Undo failed", "error");
 }
 
 async function rosterUndo(btn) {
-  const person = roster.find((p) => p.code === btn.dataset.undo);
-  const who = person ? `${person.name} (${person.code})` : btn.dataset.undo;
+  const code = btn.dataset.undo;
+  const person = rosterByCode.get(code);
+  const who = person ? `${person.name} (${person.code})` : code;
   if (!window.confirm(`Undo check-in for ${who}?\n\nThey'll be marked as not checked in.`)) return;
   btn.disabled = true;
-  const result = await undoCode(btn.dataset.undo);
+  if (lastScanId === code) lastScanId = null;
+  const result = await undoCode(code);
+  renderActiveRoleView({ animate: true });
   if (result?.status === "ok") toast(`Undid check-in for ${result.name || result.code}`);
   else toast(result?.message || "Undo failed", "error");
   if (btn.isConnected) btn.disabled = false;
 }
 
 function exportRole(role) {
-  const rows = roster.filter((r) => roleList(r).includes(role));
+  const rows = rolePeople(role).sort(compareAZ);
   const out = [["Name", "Code", "Email", "Team", "Checked In", "Time"]];
   rows.forEach((p) =>
     out.push([
@@ -787,58 +986,113 @@ ROLES.forEach((role) => {
   const label = ROLE_LABELS[role];
   view.innerHTML = `
     <div class="roster-panel">
-      <div class="roster-head">
-        <h2 class="roster-title">${label}</h2>
-        <button class="icon-btn glass" id="${role}-export-btn" type="button" aria-label="Export ${label.toLowerCase()} as CSV" title="Export CSV">${ICON_DOWNLOAD}<span>CSV</span></button>
+      <div class="roster-top">
+        <div class="search">
+          ${ICON_SEARCH}
+          <input id="${role}-search" type="search" placeholder="Name, code or team" aria-label="Search ${label.toLowerCase()} by name, code, email or team"
+                 autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search">
+          <button class="search-clear" id="${role}-search-clear" type="button" aria-label="Clear search" hidden>
+            <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+        <button class="icon-btn glass csv-btn" id="${role}-export-btn" type="button" aria-label="Export ${label.toLowerCase()} as CSV" title="Export CSV">${ICON_DOWNLOAD}</button>
       </div>
-      <div class="search">
-        ${ICON_SEARCH}
-        <input id="${role}-search" type="search" placeholder="Search name, code, team" aria-label="Search ${label.toLowerCase()}"
-               autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search">
-        <button class="search-clear" id="${role}-search-clear" type="button" aria-label="Clear search" hidden>
-          <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-        </button>
-      </div>
-      <div class="chips" role="group" aria-label="Filter ${label.toLowerCase()} by status">
+      <div class="chips" role="group" aria-label="Show ${label.toLowerCase()}">
         ${STATUS_FILTERS.map(
           ([key, text]) =>
-            `<button class="chip${key === "all" ? " active" : ""}" type="button" data-filter="${key}" aria-pressed="${key === "all"}">${text}</button>`
+            `<button class="chip${key === "out" ? " active" : ""}" type="button" data-filter="${key}" aria-pressed="${key === "out"}">${text}</button>`
         ).join("")}
       </div>
-      <ul class="person-list" id="${role}-list" aria-label="${label}"></ul>
+      <div class="vwrap">
+        <div class="person-list" id="${role}-list" role="list" aria-label="${label}">
+          <div class="vstatic" hidden></div>
+          <div class="vsizer"></div>
+        </div>
+        <div class="vhead vsticky" aria-hidden="true" hidden></div>
+        <div class="az" aria-label="Jump to letter"></div>
+        <div class="az-bubble" aria-hidden="true"></div>
+      </div>
     </div>
   `;
-  const search = document.getElementById(`${role}-search`);
-  search.addEventListener("input", () => renderRoleView(role));
-  // Enter on the phone keyboard closes it so the whole list is visible.
-  search.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") search.blur();
+  const scroller = view.querySelector(".person-list");
+  const ui = {
+    view,
+    scroller,
+    wrap: view.querySelector(".vwrap"),
+    staticEl: view.querySelector(".vstatic"),
+    sticky: view.querySelector(".vsticky"),
+    search: document.getElementById(`${role}-search`),
+    clear: document.getElementById(`${role}-search-clear`),
+    mode: null,
+    grouped: false,
+    savedScroll: 0,
+  };
+  ui.list = new VirtualList({
+    scroller,
+    sizer: view.querySelector(".vsizer"),
+    sticky: ui.sticky,
+    renderRow: (el, it) => renderPersonRow(el, it, role),
+    renderHead: renderHeadRow,
+    rowSignature,
   });
-  document.getElementById(`${role}-search-clear`).addEventListener("click", () => {
+  ui.list.onScrollExtra = () => {
+    if (view.classList.contains("active")) ui.savedScroll = scroller.scrollTop;
+    if (ui.wrap.classList.contains("has-index")) {
+      const head = ui.list.currentHead();
+      ui.index.setCurrent(head == null ? null : ui.list.items[ui.list.headIdx[head]].letter);
+    }
+  };
+  ui.index = new LetterIndex({
+    root: view.querySelector(".az"),
+    bubble: view.querySelector(".az-bubble"),
+    onJump: (letter) => ui.list.scrollToKey(`h:${letter}`),
+  });
+  rosterUI[role] = ui;
+
+  const search = ui.search;
+  search.addEventListener("input", () => renderRoleView(role));
+  // Enter / "Search" on the phone keyboard only closes it: never checks anyone in.
+  search.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      search.blur();
+    }
+  });
+  search.addEventListener("focus", () => syncLetterIndex(role));
+  search.addEventListener("blur", () => setTimeout(() => syncLetterIndex(role), 50));
+  ui.clear.addEventListener("click", () => {
     search.value = "";
     renderRoleView(role);
     search.focus();
   });
   view.querySelectorAll(".chip").forEach((chip) => {
     chip.addEventListener("click", () => {
+      // While searching the chips don't apply; tapping one leaves the search.
+      const hadQuery = !!search.value.trim();
+      search.value = "";
+      if (statusFilter[role] === chip.dataset.filter && !hadQuery) {
+        scroller.scrollTop = 0;
+        return;
+      }
       statusFilter[role] = chip.dataset.filter;
       renderRoleView(role);
-      document.getElementById(`${role}-list`).scrollTop = 0;
     });
   });
   document.getElementById(`${role}-export-btn`).addEventListener("click", () => exportRole(role));
-  document.getElementById(`${role}-list`).addEventListener("click", (e) => {
+  scroller.addEventListener("click", (e) => {
     const checkIn = e.target.closest("button[data-code]");
     const undo = e.target.closest("button[data-undo]");
-    const reset = e.target.closest("button[data-reset]");
-    if (checkIn) rosterCheckIn(checkIn);
+    if (checkIn) rosterCheckIn(checkIn.dataset.code);
     else if (undo) rosterUndo(undo);
-    else if (reset) {
+    else if (e.target.closest("button[data-clear]")) {
       search.value = "";
-      statusFilter[role] = "all";
       renderRoleView(role);
+      search.focus();
     }
   });
+  new ResizeObserver(() => {
+    if (view.classList.contains("active")) syncLetterIndex(role);
+  }).observe(scroller);
 });
 
 document.querySelectorAll(".tab-btn").forEach((btn, index) => {
@@ -854,7 +1108,7 @@ document.querySelectorAll(".tab-btn").forEach((btn, index) => {
     document.querySelector(".tabs").style.setProperty("--tab-i", String(index));
     const view = document.getElementById("view-" + btn.dataset.view);
     view.classList.add("active");
-    if (ROLES.includes(btn.dataset.view)) renderRoleView(btn.dataset.view);
+    if (ROLES.includes(btn.dataset.view)) renderRoleView(btn.dataset.view, { restore: true });
     syncCameraToVisibility();
   });
 });
@@ -1110,7 +1364,7 @@ supabase.auth.onAuthStateChange((_event, session) => {
     eventId = null;
     currentEvent = null;
     events = [];
-    roster = [];
+    setRoster([]);
     sessionUserId = null;
     setSessionEmail("");
     resetGoogleButton();
