@@ -360,7 +360,7 @@ async function switchEvent(nextId) {
   try {
     await loadRoster();
     await subscribeAttendees();
-    setInfo(`Now checking in to ${next.code}. Scan a pass or type a code.`);
+    clearCard();
   } catch (err) {
     rosterLoading = false;
     renderActiveRoleView();
@@ -447,6 +447,13 @@ function renderCard(kind, html) {
   card.classList.remove("enter");
   void card.offsetWidth;
   card.classList.add("enter");
+}
+
+// Idle: no hint card. The space stays reserved so the camera never jumps.
+function clearCard() {
+  const card = document.getElementById("status-card");
+  card.className = "idle";
+  card.innerHTML = "";
 }
 
 function setInfo(text, label = "Ready") {
@@ -1081,7 +1088,7 @@ async function startSession(session) {
     if (roster.length === 0) {
       setInfo("Connected, but the attendees roster is empty. Accept applications after setting events.code so upsert_attendee can fill the table.", "Empty roster");
     } else {
-      setInfo("Scan a pass, or type a code or email below.");
+      clearCard();
     }
   } catch (err) {
     sessionUserId = null;
