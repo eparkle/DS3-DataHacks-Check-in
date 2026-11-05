@@ -54,6 +54,7 @@ Apply the check-in SQL in the Supabase SQL Editor first so `events.code`, `atten
 | Not on roster | `lookup_not_on_roster(p_event_id, p_code_or_email)`, then `accept_walk_in(p_event_id, p_application_id)` |
 | Live updates | Realtime on `attendees` |
 | Waiver on file | `attendees.waiver_signed_at` (roster) and `waiver_signed_at` in the `check_in_by_code` result |
+| Mark waiver signed (they showed the DocuSign email) | `mark_waiver_seen(p_event_id, p_person_id, p_note)` |
 | ID check | `attendees.affiliation` and `attendees.is_18_plus_on_event_day` (roster and `check_in_by_code`) |
 | "Checked in 10:42 by Evan" | `attendees.checked_in_by` → `profiles` first name |
 
@@ -81,6 +82,8 @@ A fresh check-in shows the school (hackers) or organization, and for hackers "18
 The scan card and each roster row show whether the person's liability waiver is on file: a quiet "Waiver ✓", or an amber "No waiver". On the scan card, "No waiver · Sign now" opens a sheet with a QR code to the waiver page of their portal (`https://datahacks.ds3ucsd.com/portal/<hacker|mentor|judge|hybrid>/waiver`; set `VITE_PORTAL_URL` to point at another site). The QR is drawn on the device with zxing-wasm's writer, loaded the first time it's needed. The sheet flips to "Waiver on file" when the roster update arrives over Realtime.
 
 The site records waivers (`public.waivers`, copied onto `attendees.waiver_signed_at` by the site repo's `waivers_on_file` migration). On a database without that column the roster loads without it and no waiver marker is shown.
+
+People sign on a DocuSign PowerForm (UC San Diego's account) linked from that portal page, and organizers import the signatures from DocuSign's CSV in the site's organizer console. If someone shows the desk DocuSign's "Completed" email instead, the sheet's **They showed me the signed confirmation → Mark signed** button records it after a confirm (`mark_waiver_seen(event, attendee id, note)`, from the site's `waiver_powerform` migration; source `manual`). It needs a connection, and stays hidden offline or on a database without the function: the app asks once per event by calling it without a person, which changes nothing and answers `22004` (an older database answers `PGRST202`). The roster refresh then flips the pill to "Waiver ✓".
 
 Codes: `DH26-H001` (hacker), `DH26-J001` (judge), `DH26-M001` (mentor), `DH26-B001` (mentor+judge). Email still resolves to a code if that person is on the roster.
 

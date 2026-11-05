@@ -2,7 +2,7 @@ import { supabase } from "./supabase.js";
 import { QrScanner, prewarm as prewarmScanner } from "./scanner.js";
 import { feedback, unlockAudio, isMuted, setMuted } from "./feedback.js";
 import { searchIndex, searchPeople, compareAZ, compareNewestIn, VirtualList, LetterIndex } from "./roster.js";
-import { waiverState, waiverBadge, openWaiverSheet, syncWaiverSheet, isWaiverSheetOpen, prewarmWaiverQr } from "./waiver.js";
+import { waiverState, waiverBadge, openWaiverSheet, syncWaiverSheet, isWaiverSheetOpen, prewarmWaiverQr, setWaiverMarkHandler } from "./waiver.js";
 import {
   queue,
   callRpc,
@@ -1165,6 +1165,53 @@ async function showNotOnRoster(raw, code, fallback) {
   announce(lookup.card === "error" ? "error" : "warning");
   return { status: "unknown", message: `${info.name || raw}: ${lookup.line}` };
 }
+
+// ---------- Waiver: "They showed me the signed confirmation" ----------
+// mark_waiver_seen (site migration *_waiver_powerform) records a waiver the
+// desk saw DocuSign's completion email for. Online only. Whether this database
+// has it is asked once per event: a call without a person changes nothing and
+// answers 22004; an older database answers PGRST202 and the button stays hidden.
+const waiverMarkSupport = new Map(); // eventId -> true | false
+
+async function canMarkWaiver() {
+  const id = eventId;
+  if (!id || isOffline()) return false;
+  if (waiverMarkSupport.has(id)) return waiverMarkSupport.get(id);
+  const res = await callRpc("mark_waiver_seen", { p_event_id: id, p_person_id: null, p_note: null });
+  if (res.kind === "transient") return false; // ask again next time
+  const ok = res.kind === "error" && res.code === "22004";
+  waiverMarkSupport.set(id, ok);
+  return ok;
+}
+
+const MARK_REFUSED = {
+  not_found: "They aren't on this event's roster.",
+  not_accepted: "Their application isn't accepted.",
+  no_account: "They have no portal account, so there's nothing to attach a waiver to. Ask an organizer.",
+};
+
+async function markWaiverSigned(person) {
+  const p = rosterByCode.get(person.code);
+  if (!p?.id) return { ok: false, message: "They aren't on the roster loaded on this phone." };
+  if (isOffline()) return { ok: false, message: "Marking a waiver needs a connection. Try again once you're back online." };
+  const res = await callRpc("mark_waiver_seen", {
+    p_event_id: eventId,
+    p_person_id: p.id,
+    p_note: "Showed DocuSign completion email at check-in",
+  });
+  if (res.kind === "transient") return { ok: false, message: "Couldn't reach the server. Try again." };
+  if (isMissingApi(res)) {
+    waiverMarkSupport.set(eventId, false);
+    return { ok: false, message: "This database can't mark waivers yet." };
+  }
+  if (res.kind === "error") return { ok: false, message: res.message };
+  const status = res.data?.status;
+  if (status !== "marked" && status !== "already_on_file") return { ok: false, message: MARK_REFUSED[status] || "Couldn't mark it." };
+  reloadRoster();
+  return { ok: true, message: status === "already_on_file" ? "Already on file. Updating…" : "Marked. Updating…" };
+}
+
+setWaiverMarkHandler({ canMark: canMarkWaiver, mark: markWaiverSigned });
 
 async function acceptWalkIn(btn) {
   const applicationId = btn.dataset.walkin;

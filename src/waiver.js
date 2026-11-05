@@ -1,5 +1,8 @@
 // Liability waiver at the desk: whether someone's waiver is on file, and a
-// "Sign now" sheet with a QR code to the waiver page of their portal.
+// "Sign now" sheet with a QR code to the waiver page of their portal. People
+// sign on a DocuSign PowerForm linked from that page; if they show the desk
+// DocuSign's completion email instead, the sheet's "Mark signed" records it
+// (mark_waiver_seen, online only, hidden on a database without it).
 //
 // The site records a signed waiver in attendees.waiver_signed_at (and
 // check_in_by_code returns it). A database without that column yet gives
@@ -118,15 +121,21 @@ function ensureSheet() {
       <div class="ws-qr" role="img"></div>
       <a class="ws-url" target="_blank" rel="noopener"></a>
       <p class="ws-status" role="status" aria-live="polite"></p>
+      <div class="ws-mark" hidden>
+        <button class="ws-mark-btn" type="button">They showed me the signed confirmation <span aria-hidden="true">→</span> Mark signed</button>
+        <p class="ws-mark-msg" role="status" aria-live="polite"></p>
+      </div>
     </div>`;
   document.body.appendChild(sheet);
   sheet.querySelector(".ws-close").addEventListener("click", closeWaiverSheet);
+  sheet.querySelector(".ws-mark-btn").addEventListener("click", onMarkClick);
   // Tapping outside the card closes it.
   sheet.addEventListener("click", (e) => {
     if (e.target === sheet) closeWaiverSheet();
   });
   sheet.addEventListener("close", () => {
     sheetCode = null;
+    sheetPerson = null;
   });
   return sheet;
 }
@@ -143,15 +152,78 @@ export function closeWaiverSheet() {
 function setSheetStatus(state) {
   const status = sheet.querySelector(".ws-status");
   sheet.classList.toggle("is-signed", state === "signed");
+  if (state === "signed") sheet.querySelector(".ws-mark").hidden = true;
   status.innerHTML =
     state === "signed"
       ? `<span aria-hidden="true">✓</span> Waiver on file. You're all set.`
-      : `Waiting for their signature. This updates when it's on file.`;
+      : `Not on file yet. A new DocuSign signature shows here once organizers import it.`;
+}
+
+// ---------- "They showed me the signed confirmation" ----------
+
+// Set by main.js: { canMark(): Promise<boolean>, mark(person): Promise<{ ok, message }> }.
+let markHandler = null;
+let sheetPerson = null;
+
+export function setWaiverMarkHandler(handler) {
+  markHandler = handler;
+}
+
+function setMarkMessage(text, kind = "") {
+  const msg = sheet.querySelector(".ws-mark-msg");
+  msg.textContent = text;
+  msg.dataset.kind = kind;
+}
+
+// Shows the button when the database has mark_waiver_seen and we're online.
+async function refreshMarkButton(person) {
+  const box = sheet.querySelector(".ws-mark");
+  const btn = box.querySelector(".ws-mark-btn");
+  box.hidden = true;
+  btn.disabled = false;
+  setMarkMessage("");
+  if (!markHandler || person.waiver === "signed") return;
+  let ok = false;
+  try {
+    ok = await markHandler.canMark();
+  } catch (err) {
+    console.error(err);
+  }
+  if (sheetCode !== person.code || !sheet.open || sheet.classList.contains("is-signed")) return;
+  box.hidden = !ok;
+}
+
+async function onMarkClick() {
+  const person = sheetPerson;
+  if (!person || !markHandler) return;
+  const ok = window.confirm(
+    `Mark ${person.name || person.code}'s waiver as signed?\n\nOnly if they showed you DocuSign's "Completed" email for the DataHacks waiver.`
+  );
+  if (!ok) return;
+  const btn = sheet.querySelector(".ws-mark-btn");
+  btn.disabled = true;
+  setMarkMessage("Marking…");
+  let result;
+  try {
+    result = await markHandler.mark(person);
+  } catch (err) {
+    console.error(err);
+    result = { ok: false, message: "Couldn't mark it. Try again." };
+  }
+  if (sheetCode !== person.code) return;
+  btn.disabled = false;
+  if (result.ok) {
+    // The roster refresh flips the sheet (and the scan card) to "Waiver ✓".
+    if (!sheet.classList.contains("is-signed")) setMarkMessage(result.message || "Marked. Updating…", "ok");
+  } else {
+    setMarkMessage(result.message || "Couldn't mark it.", "error");
+  }
 }
 
 /** person: { code, name, roles, waiver } */
 export function openWaiverSheet(person) {
   const el = ensureSheet();
+  sheetPerson = person;
   const url = waiverUrl(person.roles);
   sheetCode = person.code;
   el.querySelector("#ws-title").textContent = person.name || person.code;
@@ -165,6 +237,7 @@ export function openWaiverSheet(person) {
   qr.innerHTML = `<div class="pixel-spinner" aria-hidden="true"><i></i><i></i><i></i></div>`;
   setSheetStatus(person.waiver);
   if (!el.open) el.showModal();
+  refreshMarkButton(person);
   const code = person.code;
   qrSvg(url)
     .then((svg) => {
