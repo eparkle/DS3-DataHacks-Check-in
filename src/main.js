@@ -907,9 +907,13 @@ function setScannerState(state, detail) {
 // square, portrait (iOS) or landscape, even where object-fit is ignored.
 function syncVideoAspect() {
   const video = document.getElementById("scanner-video");
+  const frame = document.getElementById("reader-frame");
+  // The frame can be taller than wide on roomy screens, so CSS needs both shapes.
+  if (frame.clientWidth && frame.clientHeight) frame.style.setProperty("--frame-ar", String(frame.clientWidth / frame.clientHeight));
   if (!video.videoWidth || !video.videoHeight) return;
-  document.getElementById("reader-frame").style.setProperty("--video-ar", String(video.videoWidth / video.videoHeight));
+  frame.style.setProperty("--video-ar", String(video.videoWidth / video.videoHeight));
 }
+new ResizeObserver(syncVideoAspect).observe(document.getElementById("reader-frame"));
 ["loadedmetadata", "resize", "playing"].forEach((type) => {
   document.getElementById("scanner-video").addEventListener(type, syncVideoAspect);
 });
