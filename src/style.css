@@ -1049,6 +1049,20 @@ button.row-checkin{ min-width:100px; height:var(--tap); padding:0 16px; font-siz
 #ws-title:focus{ outline:none; }
 .ws-status{ margin:0; text-align:center; font:500 13px/1.4 var(--font-ui); color:var(--faint); }
 .waiver-sheet.is-signed .ws-status{ color:var(--success); font-weight:700; font-size:15px; }
+/* Secondary: they already signed and show DocuSign's completion email. */
+.ws-mark{ display:flex; flex-direction:column; gap:6px; padding-top:10px; border-top:1px solid rgb(255 255 255 / .14); }
+.ws-mark[hidden]{ display:none; }
+.ws-mark-btn{
+  min-height:var(--tap); padding:8px 14px; cursor:pointer; border-radius:var(--radius-pill);
+  font:600 14px/1.25 var(--font-ui); color:var(--text); text-align:center;
+  background:rgb(255 255 255 / .08); border:1px solid rgb(255 255 255 / .28);
+}
+.ws-mark-btn:active:not(:disabled){ transform:scale(.97); }
+.ws-mark-btn:disabled{ opacity:.6; cursor:progress; }
+.ws-mark-btn:focus-visible{ outline:2px solid var(--pearl-hi); outline-offset:2px; }
+.ws-mark-msg{ margin:0; min-height:0; text-align:center; font:500 13px/1.35 var(--font-ui); color:var(--muted); }
+.ws-mark-msg:empty{ display:none; }
+.ws-mark-msg[data-kind="error"]{ color:var(--error); }
 @media (max-height: 700px){
   .ws-card{ gap:9px; padding:14px 14px 14px; }
   .ws-lead{ font-size:13px; }
