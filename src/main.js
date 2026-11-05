@@ -1,5 +1,6 @@
 import { supabase } from "./supabase.js";
 import { QrScanner, prewarm as prewarmScanner } from "./scanner.js";
+import { feedback, unlockAudio, isMuted, setMuted } from "./feedback.js";
 import "./style.css";
 
 // ---------- Phone shell: no page zoom, no page scroll ----------
@@ -36,6 +37,7 @@ syncViewportHeight();
 const ROLES = ["hacker", "judge", "mentor"];
 const ROLE_LABELS = { hacker: "Hackers", judge: "Judges", mentor: "Mentors" };
 const ROLE_SINGULAR = { hacker: "Hacker", judge: "Judge", mentor: "Mentor" };
+const RECENT_MAX = 6;
 const STATUS_FILTERS = [
   ["all", "All"],
   ["out", "Not yet"],
@@ -65,6 +67,9 @@ let scanner = null;
 let cameraWanted = false;
 let attendeesChannel = null;
 let authUrlCleaned = false;
+// The result on the status card, and the scans before it (newest first).
+let currentScan = null;
+let recentScans = [];
 
 // An OAuth error (e.g. the person closed the Google screen) comes back in the
 // query string or hash. supabase-js only consumes successful sign-ins, so read
@@ -86,11 +91,49 @@ function escapeHtml(s) {
 
 function formatTime(iso) {
   if (!iso) return null;
-  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function formatTimeSeconds(date) {
+  return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
+}
+
+// "9:41" for the narrow recent list and roster rows.
+function formatTimeShort(iso) {
+  const t = formatTime(iso);
+  return t ? t.replace(/\s?[AP]\.?M\.?$/i, "") : null;
 }
 
 function roleList(person) {
   return Array.isArray(person.roles) ? person.roles.filter(Boolean) : [];
+}
+
+// Colour key for a person: mentor + judge (B codes) gets its own colour.
+function roleKey(roles) {
+  const list = Array.isArray(roles) ? roles : [];
+  if (list.includes("mentor") && list.includes("judge")) return "both";
+  return ROLES.find((r) => list.includes(r)) || "none";
+}
+
+function roleText(roles) {
+  const list = (Array.isArray(roles) ? roles : []).filter((r) => ROLE_SINGULAR[r]);
+  return list.length ? list.map((r) => ROLE_SINGULAR[r]).join(" + ") : "Attendee";
+}
+
+function initials(name) {
+  const words = String(name || "")
+    .replace(/[^\p{L}\p{N}\s'-]/gu, " ")
+    .split(/\s+/)
+    .filter((w) => w && !/^(dr|prof|mr|mrs|ms|mx)$/i.test(w));
+  if (!words.length) return "?";
+  const first = [...words[0]][0] || "";
+  const last = words.length > 1 ? [...words[words.length - 1]][0] || "" : "";
+  return (first + last).toUpperCase();
+}
+
+// DH27-H042 -> H042 inside an event where the prefix is implied.
+function shortCode(code) {
+  return String(code || "").replace(/^[^-]+-(?=.)/, "");
 }
 
 function showAuth() {
@@ -239,6 +282,11 @@ function renderEventPicker() {
   document.querySelectorAll(".current-event-code").forEach((el) => {
     el.textContent = currentEvent.code;
   });
+  // "DataHacks 2027" from the event name, else from its start date.
+  const year =
+    (String(currentEvent.name || "").match(/\b(20\d\d)\b/) || [])[1] ||
+    (currentEvent.starts_at ? new Date(currentEvent.starts_at).getUTCFullYear() : null);
+  document.getElementById("brand-kicker").textContent = year ? `DataHacks ${year}` : "DataHacks";
   const chip = document.querySelector(".event-chip");
   chip.classList.toggle("fallback", usingFallback);
   chip.classList.toggle("single", events.length < 2);
@@ -301,25 +349,22 @@ async function switchEvent(nextId) {
   roster = [];
   rosterLoading = true;
   lastScanId = null;
+  currentScan = null;
+  recentScans = [];
+  renderRecent();
   renderEventPicker();
   renderActiveRoleView();
   select.disabled = true;
-  setStatus("", `<div class="placeholder">Switched to ${escapeHtml(next.code)}. Loading roster…</div>`);
+  setInfo(`Switched to ${next.code}. Loading roster…`, "Loading");
 
   try {
     await loadRoster();
     await subscribeAttendees();
-    setStatus(
-      "",
-      `<div class="placeholder">Now checking in to ${escapeHtml(next.code)} · ${roster.length} on the roster.</div>`
-    );
+    setInfo(`Now checking in to ${next.code}. Scan a pass or type a code.`);
   } catch (err) {
     rosterLoading = false;
     renderActiveRoleView();
-    setStatus(
-      "error",
-      `<div class="icon">🚫</div><div><div class="name">Couldn't load ${escapeHtml(next.code)}</div><div class="meta">${escapeHtml(err.message || err)}</div></div>`
-    );
+    setFailure(`Couldn't load ${next.code}`, err.message || err);
   } finally {
     select.disabled = events.length < 2;
   }
@@ -339,6 +384,7 @@ async function loadRoster() {
   roster = (data || []).map(normalizeRow);
   rosterLoading = false;
   renderActiveRoleView();
+  renderRecent();
 }
 
 function renderActiveRoleView() {
@@ -383,17 +429,113 @@ function resolveCode(raw) {
   return match ? match.code : upper;
 }
 
-function setStatus(kind, html) {
+// ---------- Scan result card ----------
+// One fixed-height card under the camera: a coloured band (state + time) over
+// an end-stone body (role tile, name, code · role · team, Undo).
+
+const BAND = {
+  success: { icon: "✓", label: "Checked in" },
+  warning: { icon: "↺", label: "Already in" },
+  error: { icon: "✕", label: "Not on roster" },
+};
+
+function renderCard(kind, html) {
   const card = document.getElementById("status-card");
-  card.className = kind || "";
+  card.className = kind;
   card.innerHTML = html;
+  // Restart the entrance animation for every new result.
+  card.classList.remove("enter");
+  void card.offsetWidth;
+  card.classList.add("enter");
 }
 
-function personMeta(data) {
-  const roles = Array.isArray(data?.roles) ? data.roles.join(", ").toUpperCase() : "ATTENDEE";
-  const team = data?.team ? ` · ${data.team}` : "";
-  const at = formatTime(data?.checked_in_at);
-  return { roles, team, at };
+function setInfo(text, label = "Ready") {
+  renderCard(
+    "info",
+    `<div class="band"><span class="band-title"><span class="sq" aria-hidden="true"></span>${escapeHtml(label)}</span><span class="band-time">${escapeHtml(currentEvent?.code || "")}</span></div>
+     <div class="body"><p class="info-text">${escapeHtml(text)}</p></div>`
+  );
+}
+
+function setFailure(title, detail) {
+  renderCard(
+    "error",
+    `<div class="band"><span class="band-title"><span aria-hidden="true">✕</span> ${escapeHtml(title)}</span></div>
+     <div class="body"><div class="avatar role-none" aria-hidden="true">!</div><div class="who"><div class="name">${escapeHtml(title)}</div><div class="meta">${escapeHtml(detail)}</div></div></div>`
+  );
+}
+
+function showScan(scan) {
+  const band = BAND[scan.kind];
+  const undo =
+    scan.kind === "success"
+      ? `<button class="undo-btn" type="button" data-card-undo="${escapeHtml(scan.code)}" aria-label="Undo check-in for ${escapeHtml(scan.name)}">Undo</button>`
+      : "";
+  const metaParts =
+    scan.kind === "error"
+      ? [scan.hint]
+      : [scan.roleText, scan.team, scan.kind === "warning" ? "no action taken" : ""].filter(Boolean);
+  renderCard(
+    scan.kind,
+    `<div class="band"><span class="band-title"><span aria-hidden="true">${band.icon}</span> ${band.label}</span><span class="band-time">${escapeHtml(scan.bandRight)}</span></div>
+     <div class="body">
+       <div class="avatar role-${scan.role}" aria-hidden="true">${escapeHtml(scan.kind === "error" ? "?" : initials(scan.name))}</div>
+       <div class="who">
+         <div class="name">${escapeHtml(scan.kind === "error" ? "Unknown code" : scan.name)}</div>
+         <div class="meta"><code>${escapeHtml(scan.code)}</code>${metaParts.map((p) => ` · ${escapeHtml(p)}`).join("")}</div>
+       </div>
+       ${undo}
+     </div>`
+  );
+}
+
+// The previous result moves into the recent list when a new one arrives.
+function pushScan(scan) {
+  if (currentScan) recentScans = [currentScan, ...recentScans].slice(0, RECENT_MAX);
+  currentScan = scan;
+  showScan(scan);
+  renderRecent();
+}
+
+function renderRecent() {
+  const list = document.getElementById("recent-list");
+  if (!list) return;
+  document.getElementById("recent").classList.toggle("empty", !recentScans.length);
+  list.innerHTML = recentScans
+    .map((scan) => {
+      const person = roster.find((p) => p.code === scan.code);
+      const undone = scan.kind !== "error" && person && !person.checked_in;
+      const kind = undone ? "undone" : scan.kind;
+      const status =
+        kind === "undone"
+          ? `<span class="t">undone</span>`
+          : kind === "error"
+            ? `<span class="t"><span aria-hidden="true">✕</span><span class="visually-hidden">Unknown code,</span> ${escapeHtml(scan.timeShort)}</span>`
+            : kind === "warning"
+              ? `<span class="t"><span aria-hidden="true">↺</span><span class="visually-hidden">Already in since</span> ${escapeHtml(scan.inShort || scan.timeShort)}</span>`
+              : `<span class="t"><span aria-hidden="true">✓</span><span class="visually-hidden">Checked in</span> ${escapeHtml(scan.inShort || scan.timeShort)}</span>`;
+      return `<li class="recent-row is-${kind}">
+        <span class="sq role-${scan.role}" aria-hidden="true"></span>
+        <span class="nm">${escapeHtml(scan.kind === "error" ? "Unknown code" : scan.name)}</span>
+        <code>${escapeHtml(shortCode(scan.code))}</code>${status}</li>`;
+    })
+    .join("");
+}
+
+// Soft colour glow on the camera frame (~1.1 s), then back to the quiet edge.
+let flashTimer = null;
+function flashFrame(kind) {
+  const frame = document.getElementById("reader-frame");
+  delete frame.dataset.flash;
+  void frame.offsetWidth;
+  frame.dataset.flash = kind;
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => delete frame.dataset.flash, 1200);
+}
+
+function announce(kind) {
+  flashFrame(kind);
+  feedback(kind);
 }
 
 async function processCode(rawText) {
@@ -405,7 +547,7 @@ async function processCode(rawText) {
   lastScanId = code;
   lastScanTime = now;
 
-  setStatus("", `<div class="placeholder">Looking up ${escapeHtml(code)}…</div>`);
+  setInfo(`Looking up ${code}…`, "Checking");
 
   const { data, error } = await supabase.rpc("check_in_by_code", {
     p_event_id: eventId,
@@ -413,45 +555,45 @@ async function processCode(rawText) {
   });
 
   if (error) {
-    setStatus(
-      "error",
-      `<div class="icon">🚫</div><div><div class="name">Check-in failed</div><div class="meta">${escapeHtml(error.message || error)}</div></div>`
-    );
+    setFailure("Check-in failed", error.message || error);
+    announce("error");
     return { status: "error", message: error.message || String(error) };
   }
 
   const status = data?.status;
-  const meta = personMeta(data);
+  const scannedAt = new Date();
+  const base = {
+    code: (data?.code || code).toUpperCase(),
+    name: data?.name || code,
+    role: roleKey(data?.roles),
+    roleText: roleText(data?.roles),
+    team: data?.team || "",
+    timeShort: formatTimeShort(scannedAt.toISOString()),
+    inShort: formatTimeShort(data?.checked_in_at),
+  };
 
   if (status === "unknown") {
     const prefix = (code.match(/^([A-Z0-9]{2,10})-[HJMB]\d+$/) || [])[1] || "";
     const eventCode = (currentEvent?.code || "").toUpperCase();
     const hint =
       prefix && eventCode && prefix !== eventCode
-        ? `This code is for ${prefix}, but you're checking in to ${eventCode}.`
-        : `"${raw}" is not on the ${eventCode} attendees roster`;
-    setStatus(
-      "error",
-      `<div class="icon">⚠️</div><div><div class="name">Unrecognized code</div><div class="meta">${escapeHtml(hint)}</div></div>`
-    );
-    return { status: "unknown", message: hint };
+        ? `this pass is for ${prefix}, not ${eventCode}`
+        : `not on the ${eventCode} roster`;
+    pushScan({ ...base, kind: "error", code, role: "none", hint, bandRight: eventCode });
+    announce("error");
+    return { status: "unknown", message: prefix && prefix !== eventCode ? `This code is for ${prefix}, but you're checking in to ${eventCode}.` : `"${raw}" is not on the ${eventCode} attendees roster` };
   }
 
   if (status === "dupe") {
-    setStatus(
-      "error",
-      `<div class="icon">↩️</div><div><div class="name">${escapeHtml(data.name)} — already checked in</div><div class="meta">${escapeHtml(data.code)} · ${escapeHtml(meta.roles)}${meta.at ? " · at " + meta.at : ""}</div></div>`
-    );
+    const since = formatTime(data.checked_in_at);
+    pushScan({ ...base, kind: "warning", bandRight: since ? `since ${since}` : "" });
+    announce("warning");
   } else if (status === "ok") {
-    setStatus(
-      "success",
-      `<div class="icon">✅</div><div><div class="name">${escapeHtml(data.name)}</div><div class="meta">${escapeHtml(data.code)} · ${escapeHtml(meta.roles)}${escapeHtml(meta.team)} · checked in ${escapeHtml(meta.at || "")}</div></div>`
-    );
+    pushScan({ ...base, kind: "success", bandRight: formatTimeSeconds(data.checked_in_at ? new Date(data.checked_in_at) : scannedAt) });
+    announce("success");
   } else {
-    setStatus(
-      "error",
-      `<div class="icon">🚫</div><div><div class="name">Unexpected response</div><div class="meta">${escapeHtml(JSON.stringify(data))}</div></div>`
-    );
+    setFailure("Unexpected response", JSON.stringify(data));
+    announce("error");
   }
 
   try {
@@ -468,17 +610,13 @@ async function undoCode(code) {
     p_code: code,
   });
   if (error) {
-    setStatus(
-      "error",
-      `<div class="icon">🚫</div><div><div class="name">Undo failed</div><div class="meta">${escapeHtml(error.message || error)}</div></div>`
-    );
+    setFailure("Undo failed", error.message || error);
     return { status: "error", message: error.message || String(error) };
   }
   if (data?.status === "ok") {
-    setStatus(
-      "",
-      `<div class="placeholder">Undid check-in for ${escapeHtml(data.name || data.code)}</div>`
-    );
+    // An undone scan doesn't belong in the recent list.
+    if (currentScan?.code === data.code) currentScan = null;
+    setInfo(`Undid check-in for ${data.name || data.code}.`, "Undone");
   }
   try {
     await loadRoster();
@@ -493,9 +631,6 @@ function compareByName(a, b) {
   return a.name.localeCompare(b.name, undefined, { sensitivity: "base" }) || a.code.localeCompare(b.code);
 }
 
-const ICON_CHECK =
-  '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-
 function personRow(p, role) {
   const otherRoles = roleList(p).filter((r) => r !== role && ROLE_SINGULAR[r]);
   // Mentors and judges show their role label (e.g. "Mentor + Judge" for a B code).
@@ -504,18 +639,16 @@ function personRow(p, role) {
       ? ""
       : [role, ...otherRoles].map((r) => ROLE_SINGULAR[r]).join(" + ");
   const details = [p.team, roleLabel].filter(Boolean);
-  const status = p.checked_in
-    ? `<span class="status-badge in">${ICON_CHECK}<span>In${p.at ? ` · ${escapeHtml(p.at)}` : ""}</span></span>`
-    : `<span class="status-badge out"><span>Not yet</span></span>`;
   const action = p.checked_in
-    ? `<button class="row-undo" type="button" data-undo="${escapeHtml(p.code)}" aria-label="Undo check-in for ${escapeHtml(p.name)}">Undo</button>`
-    : `<button class="primary row-checkin" type="button" data-code="${escapeHtml(p.code)}" aria-label="Check in ${escapeHtml(p.name)}">Check in</button>`;
+    ? `<span class="in-time"><span aria-hidden="true">✓</span><span class="visually-hidden">Checked in</span>${p.at ? ` ${escapeHtml(formatTimeShort(p.checked_in_at))}` : ""}</span>
+       <button class="row-undo" type="button" data-undo="${escapeHtml(p.code)}" aria-label="Undo check-in for ${escapeHtml(p.name)}">Undo</button>`
+    : `<span class="visually-hidden">Not checked in yet.</span>
+       <button class="primary row-checkin" type="button" data-code="${escapeHtml(p.code)}" aria-label="Check in ${escapeHtml(p.name)}">Check in</button>`;
   return `
     <li class="person ${p.checked_in ? "is-in" : "is-out"}">
       <div class="person-main">
         <div class="person-name">${escapeHtml(p.name)}</div>
-        <div class="person-meta">${status}<span class="person-code">${escapeHtml(p.code)}</span></div>
-        ${details.length ? `<div class="person-details">${details.map((d) => `<span>${escapeHtml(d)}</span>`).join("")}</div>` : ""}
+        <div class="person-sub"><code title="${escapeHtml(p.code)}">${escapeHtml(shortCode(p.code))}</code>${details.map((d) => `<span>${escapeHtml(d)}</span>`).join("")}</div>
       </div>
       <div class="person-action">${action}</div>
     </li>`;
@@ -528,22 +661,10 @@ function renderRoleView(role) {
   const filter = statusFilter[role];
   const label = ROLE_LABELS[role].toLowerCase();
 
-  const checkedInCount = all.filter((r) => r.checked_in).length;
-  const notYetCount = all.length - checkedInCount;
-  const pct = all.length ? Math.round((checkedInCount / all.length) * 100) : 0;
-  document.getElementById(`${role}-count`).innerHTML = rosterLoading
-    ? `<b>—</b><span class="summary-of"> / —</span>`
-    : `<b>${checkedInCount}</b><span class="summary-of"> / ${all.length}</span>`;
-  const bar = document.getElementById(`${role}-progress`);
-  bar.style.setProperty("--pct", `${rosterLoading ? 0 : pct}%`);
-  bar.setAttribute("aria-valuenow", String(rosterLoading ? 0 : pct));
-  bar.setAttribute("aria-valuetext", `${checkedInCount} of ${all.length} checked in`);
-  const counts = { all: all.length, in: checkedInCount, out: notYetCount };
   document.querySelectorAll(`#view-${role} .chip`).forEach((chip) => {
     const active = chip.dataset.filter === filter;
     chip.classList.toggle("active", active);
     chip.setAttribute("aria-pressed", String(active));
-    chip.querySelector(".chip-count").textContent = rosterLoading ? "" : counts[chip.dataset.filter];
   });
   document.getElementById(`${role}-search-clear`).hidden = !search;
 
@@ -557,7 +678,7 @@ function renderRoleView(role) {
   }
 
   if (all.length === 0) {
-    list.innerHTML = `<li class="empty-state"><b>No ${label} on the ${escapeHtml(currentEvent?.code || "")} roster yet.</b><span>People appear here once their application is accepted.</span></li>`;
+    list.innerHTML = `<li class="empty-state"><span class="empty-glyph" aria-hidden="true"></span><b>No ${label} on the ${escapeHtml(currentEvent?.code || "")} roster yet.</b><span>People appear here once their application is accepted.</span></li>`;
     return;
   }
 
@@ -573,7 +694,7 @@ function renderRoleView(role) {
       : filter === "in"
         ? `No ${label} checked in yet.`
         : `Everyone's checked in.`;
-    list.innerHTML = `<li class="empty-state"><b>${why}</b>${
+    list.innerHTML = `<li class="empty-state"><span class="empty-glyph" aria-hidden="true"></span><b>${why}</b>${
       search || filter !== "all" ? `<button class="ghost small" type="button" data-reset>Show all ${label}</button>` : ""
     }</li>`;
     return;
@@ -582,7 +703,7 @@ function renderRoleView(role) {
   list.innerHTML = groups
     .map(
       (g) =>
-        `<li class="group-head" role="presentation"><span>${g.title}</span><span class="group-count">${g.people.length}</span></li>` +
+        `<li class="group-head" role="presentation">${g.title}</li>` +
         g.people.map((p) => personRow(p, role)).join("")
     )
     .join("");
@@ -605,7 +726,7 @@ async function rosterCheckIn(btn) {
   btn.textContent = "Checking…";
   const result = await processCode(btn.dataset.code);
   if (result?.status === "ok") toast(`Checked in ${result.name || result.code}`, "success");
-  else if (result?.status === "dupe") toast(`${result.name || result.code} was already checked in`, "error");
+  else if (result?.status === "dupe") toast(`${result.name || result.code} was already checked in`, "warning");
   else if (result?.status === "throttled") toast("Just checked that code. Give it a second.");
   else toast(result?.message || "Check-in failed", "error");
   // A successful check-in re-renders the list; otherwise restore the button.
@@ -659,29 +780,23 @@ ROLES.forEach((role) => {
   const label = ROLE_LABELS[role];
   view.innerHTML = `
     <div class="roster-panel">
-      <div class="roster-top">
-        <div class="summary">
-          <div class="summary-text">
-            <div class="summary-count" id="${role}-count"><b>—</b><span class="summary-of"> / —</span></div>
-            <div class="summary-label">checked in</div>
-          </div>
-          <button class="icon-btn" id="${role}-export-btn" type="button" aria-label="Export ${label.toLowerCase()} as CSV" title="Export CSV">${ICON_DOWNLOAD}<span>CSV</span></button>
-        </div>
-        <div class="progress" id="${role}-progress" role="progressbar" aria-label="${label} checked in" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
-        <div class="chips" role="group" aria-label="Filter ${label.toLowerCase()} by status">
-          ${STATUS_FILTERS.map(
-            ([key, text]) =>
-              `<button class="chip${key === "all" ? " active" : ""}" type="button" data-filter="${key}" aria-pressed="${key === "all"}">${text}<span class="chip-count"></span></button>`
-          ).join("")}
-        </div>
-        <div class="search">
-          ${ICON_SEARCH}
-          <input id="${role}-search" type="search" placeholder="Search name, code, team" aria-label="Search ${label.toLowerCase()}"
-                 autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search">
-          <button class="search-clear" id="${role}-search-clear" type="button" aria-label="Clear search" hidden>
-            <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-          </button>
-        </div>
+      <div class="roster-head">
+        <h2 class="roster-title">${label}</h2>
+        <button class="icon-btn glass" id="${role}-export-btn" type="button" aria-label="Export ${label.toLowerCase()} as CSV" title="Export CSV">${ICON_DOWNLOAD}<span>CSV</span></button>
+      </div>
+      <div class="search">
+        ${ICON_SEARCH}
+        <input id="${role}-search" type="search" placeholder="Search name, code, team" aria-label="Search ${label.toLowerCase()}"
+               autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search">
+        <button class="search-clear" id="${role}-search-clear" type="button" aria-label="Clear search" hidden>
+          <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+      <div class="chips" role="group" aria-label="Filter ${label.toLowerCase()} by status">
+        ${STATUS_FILTERS.map(
+          ([key, text]) =>
+            `<button class="chip${key === "all" ? " active" : ""}" type="button" data-filter="${key}" aria-pressed="${key === "all"}">${text}</button>`
+        ).join("")}
       </div>
       <ul class="person-list" id="${role}-list" aria-label="${label}"></ul>
     </div>
@@ -719,11 +834,17 @@ ROLES.forEach((role) => {
   });
 });
 
-document.querySelectorAll(".tab-btn").forEach((btn) => {
+document.querySelectorAll(".tab-btn").forEach((btn, index) => {
   btn.addEventListener("click", () => {
-    document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+    document.querySelectorAll(".tab-btn").forEach((b) => {
+      b.classList.remove("active");
+      b.removeAttribute("aria-current");
+    });
     document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
     btn.classList.add("active");
+    btn.setAttribute("aria-current", "page");
+    // Slides the selection pill under the tab.
+    document.querySelector(".tabs").style.setProperty("--tab-i", String(index));
     const view = document.getElementById("view-" + btn.dataset.view);
     view.classList.add("active");
     if (ROLES.includes(btn.dataset.view)) renderRoleView(btn.dataset.view);
@@ -738,13 +859,14 @@ document.getElementById("event-select").addEventListener("change", (e) => {
 document.getElementById("manual-form").addEventListener("submit", (e) => {
   e.preventDefault();
   const input = document.getElementById("manual-input");
+  unlockAudio();
   if (!input.value.trim()) return;
   processCode(input.value);
   input.value = "";
 });
 
 const SCANNER_MESSAGES = {
-  idle: "Camera is off. Tap Start camera to scan.",
+  idle: "Camera is off. Start it to scan passes.",
   starting: "Starting camera…",
   paused: "Camera paused. It comes back when you return to this tab.",
 };
@@ -765,6 +887,8 @@ function setScannerState(state, detail) {
   const live = state === "starting" || state === "scanning";
   startBtn.disabled = live;
   stopBtn.disabled = !live && !cameraWanted;
+  document.getElementById("live-label").textContent = state === "scanning" ? "Scanning" : "Starting";
+  syncTorchButton();
   if (state === "error") {
     cameraWanted = false;
     stopBtn.disabled = true;
@@ -789,9 +913,6 @@ function getScanner() {
     video.muted = true;
     scanner = new QrScanner(video, {
       onDecode: (text) => {
-        const frame = document.getElementById("reader-frame");
-        frame.classList.add("hit");
-        setTimeout(() => frame.classList.remove("hit"), 600);
         processCode(text);
       },
       onState: setScannerState,
@@ -806,8 +927,47 @@ function scanTabVisible() {
 
 function startCamera() {
   cameraWanted = true;
+  unlockAudio();
   getScanner().start();
 }
+
+// Flashlight button: only shown while scanning on a camera that has a torch.
+let torchOn = false;
+function syncTorchButton() {
+  const btn = document.getElementById("torch-btn");
+  const scanning = document.getElementById("reader-frame").dataset.state === "scanning";
+  const supported = scanning && !!scanner?.torchSupported;
+  if (!supported) torchOn = false;
+  btn.hidden = !supported;
+  btn.setAttribute("aria-pressed", String(torchOn));
+}
+
+document.getElementById("torch-btn").addEventListener("click", async () => {
+  if (!scanner) return;
+  const next = !torchOn;
+  if (await scanner.setTorch(next)) torchOn = next;
+  syncTorchButton();
+});
+
+function syncSoundButton() {
+  const btn = document.getElementById("sound-btn");
+  const on = !isMuted();
+  btn.setAttribute("aria-pressed", String(on));
+  btn.title = on ? "Scan sounds on" : "Scan sounds off";
+}
+document.getElementById("sound-btn").addEventListener("click", () => {
+  setMuted(!isMuted());
+  syncSoundButton();
+});
+syncSoundButton();
+
+document.getElementById("status-card").addEventListener("click", async (e) => {
+  const btn = e.target.closest("button[data-card-undo]");
+  if (!btn) return;
+  btn.disabled = true;
+  await undoCode(btn.dataset.cardUndo);
+  if (btn.isConnected) btn.disabled = false;
+});
 
 function stopCamera() {
   cameraWanted = false;
@@ -919,10 +1079,9 @@ async function startSession(session) {
     // Fetch the QR decoder in the background so Start camera is instant.
     (window.requestIdleCallback || ((fn) => setTimeout(fn, 200)))(() => prewarmScanner());
     if (roster.length === 0) {
-      setStatus(
-        "",
-        `<div class="placeholder">Connected, but the attendees roster is empty. Accept applications after setting events.code so upsert_attendee can fill the table.</div>`
-      );
+      setInfo("Connected, but the attendees roster is empty. Accept applications after setting events.code so upsert_attendee can fill the table.", "Empty roster");
+    } else {
+      setInfo("Scan a pass, or type a code or email below.");
     }
   } catch (err) {
     sessionUserId = null;
