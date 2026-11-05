@@ -51,6 +51,13 @@ Apply the check-in SQL in the Supabase SQL Editor first so `events.code`, `atten
 | Duplicate scan | RPC returns `{ status: "dupe" }` |
 | Undo | `undo_check_in(p_event_id, p_code)` |
 | Live updates | Realtime on `attendees` |
+| Waiver on file | `attendees.waiver_signed_at` (roster) and `waiver_signed_at` in the `check_in_by_code` result |
+
+## Liability waiver
+
+The scan card and each roster row show whether the person's liability waiver is on file: a quiet "Waiver ✓", or an amber "No waiver". On the scan card, "No waiver · Sign now" opens a sheet with a QR code to the waiver page of their portal (`https://datahacks.ds3ucsd.com/portal/<hacker|mentor|judge|hybrid>/waiver`; set `VITE_PORTAL_URL` to point at another site). The QR is drawn on the device with zxing-wasm's writer, loaded the first time it's needed. The sheet flips to "Waiver on file" when the roster update arrives over Realtime.
+
+The site records waivers (`public.waivers`, copied onto `attendees.waiver_signed_at` by the site repo's `waivers_on_file` migration). On a database without that column the roster loads without it and no waiver marker is shown.
 
 Codes: `DH26-H001` (hacker), `DH26-J001` (judge), `DH26-M001` (mentor), `DH26-B001` (mentor+judge). Email still resolves to a code if that person is on the roster.
 

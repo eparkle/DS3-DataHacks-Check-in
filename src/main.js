@@ -2,6 +2,7 @@ import { supabase } from "./supabase.js";
 import { QrScanner, prewarm as prewarmScanner } from "./scanner.js";
 import { feedback, unlockAudio, isMuted, setMuted } from "./feedback.js";
 import { searchIndex, searchPeople, compareAZ, compareNewestIn, VirtualList, LetterIndex } from "./roster.js";
+import { waiverState, waiverBadge, openWaiverSheet, syncWaiverSheet, isWaiverSheetOpen, prewarmWaiverQr } from "./waiver.js";
 import "./style.css";
 
 // ---------- Phone shell: no page zoom, no page scroll ----------
@@ -209,6 +210,8 @@ function normalizeRow(row) {
     checked_in: !!row.checked_in_at,
     checked_in_at: row.checked_in_at,
     at: formatTime(row.checked_in_at),
+    // "signed" | "missing" | "unknown" (database without attendees.waiver_signed_at yet).
+    waiver: waiverState(row),
   };
   person.search = searchIndex(person);
   return person;
@@ -217,6 +220,21 @@ function normalizeRow(row) {
 function setRoster(rows) {
   roster = rows;
   rosterByCode = new Map(roster.map((p) => [p.code, p]));
+  syncWaiverViews();
+}
+
+// Someone signed while their scan card (or the Sign now sheet) is up: show it.
+function syncWaiverViews() {
+  syncWaiverSheet((code) => rosterByCode.get(code));
+  if (!currentScan || currentScan.kind === "error") return;
+  // Only while the card still shows that scan (not "Looking up…" or an error).
+  if (document.getElementById("status-card")?.dataset.scan !== currentScan.code) return;
+  const p = rosterByCode.get(currentScan.code);
+  if (!p) return;
+  if (p.waiver !== currentScan.waiver && p.waiver !== "unknown") {
+    currentScan.waiver = p.waiver;
+    showScan(currentScan, { quiet: true });
+  }
 }
 
 // Apply a check-in or undo locally so the list updates at once; the
@@ -391,13 +409,25 @@ async function switchEvent(nextId) {
   }
 }
 
+const ROSTER_COLUMNS = "id, event_id, code, name, email, roles, team, checked_in_at";
+// False once the database says attendees has no waiver_signed_at (the site's
+// waivers migration isn't on it yet): the roster then loads without it.
+let waiverColumn = true;
+const isMissingWaiverColumn = (error) =>
+  error?.code === "42703" || error?.code === "PGRST204" || /waiver_signed_at/.test(error?.message || "");
+
+async function fetchRoster(id) {
+  if (waiverColumn) {
+    const res = await supabase.from("attendees").select(`${ROSTER_COLUMNS}, waiver_signed_at`).eq("event_id", id).order("code");
+    if (!res.error || !isMissingWaiverColumn(res.error)) return res;
+    waiverColumn = false;
+  }
+  return supabase.from("attendees").select(ROSTER_COLUMNS).eq("event_id", id).order("code");
+}
+
 async function loadRoster() {
   const requestedEventId = eventId;
-  const { data, error } = await supabase
-    .from("attendees")
-    .select("id, event_id, code, name, email, roles, team, checked_in_at")
-    .eq("event_id", requestedEventId)
-    .order("code");
+  const { data, error } = await fetchRoster(requestedEventId);
 
   if (error) throw error;
   // The organizer switched events while this was in flight.
@@ -513,10 +543,12 @@ const BAND = {
   error: { icon: "✕", label: "Not on roster" },
 };
 
-function renderCard(kind, html) {
+function renderCard(kind, html, { quiet = false } = {}) {
   const card = document.getElementById("status-card");
   card.className = kind;
   card.innerHTML = html;
+  delete card.dataset.scan;
+  if (quiet) return;
   // Restart the entrance animation for every new result.
   card.classList.remove("enter");
   void card.offsetWidth;
@@ -546,7 +578,7 @@ function setFailure(title, detail) {
   );
 }
 
-function showScan(scan) {
+function showScan(scan, { quiet = false } = {}) {
   const band = BAND[scan.kind];
   const undo =
     scan.kind === "success"
@@ -556,6 +588,10 @@ function showScan(scan) {
     scan.kind === "error"
       ? [scan.hint]
       : [scan.roleText, scan.team, scan.kind === "warning" ? "no action taken" : ""].filter(Boolean);
+  // Waiver on file or not (nothing when the database can't say). It sits at the
+  // end of the meta line and never truncates; the code goes short to make room.
+  const waiver = scan.kind === "error" ? "" : waiverBadge(scan.waiver, { code: scan.code, name: scan.name, button: true });
+  const code = waiver ? shortCode(scan.code) : scan.code;
   renderCard(
     scan.kind,
     `<div class="band"><span class="band-title"><span aria-hidden="true">${band.icon}</span> ${band.label}</span><span class="band-time">${escapeHtml(scan.bandRight)}</span></div>
@@ -563,11 +599,14 @@ function showScan(scan) {
        <div class="avatar role-${scan.role}" aria-hidden="true">${escapeHtml(scan.kind === "error" ? "?" : initials(scan.name))}</div>
        <div class="who">
          <div class="name">${escapeHtml(scan.kind === "error" ? "Unknown code" : scan.name)}</div>
-         <div class="meta"><code>${escapeHtml(scan.code)}</code>${metaParts.map((p) => ` · ${escapeHtml(p)}`).join("")}</div>
+         <div class="meta"><code title="${escapeHtml(scan.code)}">${escapeHtml(code)}</code><span class="meta-text">${metaParts.map((p) => ` · ${escapeHtml(p)}`).join("")}</span>${waiver}</div>
        </div>
        ${undo}
-     </div>`
+     </div>`,
+    { quiet }
   );
+  document.getElementById("status-card").dataset.scan = scan.code;
+  if (scan.waiver === "missing") prewarmWaiverQr();
 }
 
 // The previous result moves into the recent list when a new one arrives.
@@ -651,6 +690,9 @@ async function processCode(rawText) {
     team: data?.team || "",
     timeShort: formatTimeShort(scannedAt.toISOString()),
     inShort: formatTimeShort(data?.checked_in_at),
+    roles: Array.isArray(data?.roles) ? data.roles : [],
+    // From check_in_by_code when the database has waivers, else the roster's copy.
+    waiver: data && "waiver_signed_at" in data ? waiverState(data) : rosterByCode.get((data?.code || code).toUpperCase())?.waiver || "unknown",
   };
 
   if (status === "unknown") {
@@ -719,7 +761,7 @@ function roleLabelFor(p, role) {
 
 function rowSignature(it) {
   const p = it.person;
-  return `${p.id}|${p.name}|${p.team}|${p.checked_in_at || ""}|${rowState.get(p.id) || ""}`;
+  return `${p.id}|${p.name}|${p.team}|${p.checked_in_at || ""}|${p.waiver}|${rowState.get(p.id) || ""}`;
 }
 
 function renderPersonRow(el, it, role) {
@@ -744,7 +786,7 @@ function renderPersonRow(el, it, role) {
   el.innerHTML = `
     <div class="person-main">
       <div class="person-name" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</div>
-      <div class="person-sub"><code title="${escapeHtml(p.code)}">${escapeHtml(shortCode(p.code))}</code>${details.map((d) => `<span>${escapeHtml(d)}</span>`).join("")}</div>
+      <div class="person-sub"><code title="${escapeHtml(p.code)}">${escapeHtml(shortCode(p.code))}</code>${details.length ? `<span class="sub-d">${details.map(escapeHtml).join(" · ")}</span>` : ""}${waiverBadge(p.waiver)}</div>
     </div>
     <div class="person-action">${action}</div>`;
 }
@@ -955,7 +997,8 @@ async function rosterUndo(btn) {
 
 function exportRole(role) {
   const rows = rolePeople(role).sort(compareAZ);
-  const out = [["Name", "Code", "Email", "Team", "Checked In", "Time"]];
+  const withWaiver = rows.some((p) => p.waiver !== "unknown");
+  const out = [["Name", "Code", "Email", "Team", "Checked In", "Time", ...(withWaiver ? ["Waiver"] : [])]];
   rows.forEach((p) =>
     out.push([
       p.name,
@@ -964,6 +1007,7 @@ function exportRole(role) {
       p.team,
       p.checked_in ? "yes" : "no",
       p.at || "",
+      ...(withWaiver ? [p.waiver === "signed" ? "yes" : p.waiver === "missing" ? "no" : ""] : []),
     ])
   );
   const csv = out.map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
@@ -1178,6 +1222,8 @@ function getScanner() {
     video.muted = true;
     scanner = new QrScanner(video, {
       onDecode: (text) => {
+        // The Sign now sheet covers the card: don't check anyone in behind it.
+        if (isWaiverSheetOpen()) return;
         processCode(text);
       },
       onState: setScannerState,
@@ -1227,6 +1273,14 @@ document.getElementById("sound-btn").addEventListener("click", () => {
 syncSoundButton();
 
 document.getElementById("status-card").addEventListener("click", async (e) => {
+  const sign = e.target.closest("button[data-waiver-sign]");
+  if (sign) {
+    const code = sign.dataset.waiverSign;
+    const scan = currentScan?.code === code ? currentScan : null;
+    const p = rosterByCode.get(code);
+    openWaiverSheet({ code, name: scan?.name || p?.name || code, roles: scan?.roles?.length ? scan.roles : p?.roles || [], waiver: p?.waiver || scan?.waiver || "missing" });
+    return;
+  }
   const btn = e.target.closest("button[data-card-undo]");
   if (!btn) return;
   btn.disabled = true;
