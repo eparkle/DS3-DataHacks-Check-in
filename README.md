@@ -47,11 +47,34 @@ Apply the check-in SQL in the Supabase SQL Editor first so `events.code`, `atten
 | App action | Backend |
 | --- | --- |
 | Load roster | `attendees` for the event with a `code` |
-| Scan / manual / list check-in | `check_in_by_code(p_event_id, p_code)` |
+| Scan / manual / list check-in | `check_in_by_code(p_event_id, p_code, p_checked_in_at, p_client_id, p_source)` |
 | Duplicate scan | RPC returns `{ status: "dupe" }` |
-| Undo | `undo_check_in(p_event_id, p_code)` |
+| Undo | `undo_check_in(p_event_id, p_code, p_expected_checked_in_at, p_source)` |
+| Meal / swag scan | `record_scan(p_event_id, p_code, p_scan_type_id, p_scanned_at, p_client_id, p_source)`; types from `scan_types`, who already had one from `checkin_events` |
+| Not on roster | `lookup_not_on_roster(p_event_id, p_code_or_email)`, then `accept_walk_in(p_event_id, p_application_id)` |
 | Live updates | Realtime on `attendees` |
 | Waiver on file | `attendees.waiver_signed_at` (roster) and `waiver_signed_at` in the `check_in_by_code` result |
+| ID check | `attendees.affiliation` and `attendees.is_18_plus_on_event_day` (roster and `check_in_by_code`) |
+| "Checked in 10:42 by Evan" | `attendees.checked_in_by` → `profiles` first name |
+
+The extra parameters, tables and columns come from the site repo's check-in log + scans migration. The app works on a database without them: an RPC that answers PGRST202 to the new parameters is called again the old way (and remembered for the session), the roster loads without missing columns, and with no `scan_types` table there's no mode switch.
+
+## Meals and swag
+
+When the event has active scan types (set up in the organizer console), a chip on the camera's top-left picks what scans record: **Check-in** (default) or a scan type such as "Lunch · Sat". In a scan mode the chip, the camera edge, the Record button and the result card turn indigo, and the card names the scan type:
+
+- ✓ Lunch · Sat (recorded)
+- amber "Already had Lunch · Sat" with the first time and who scanned it (one per person per scan type)
+- amber "Not checked in yet" (still recorded, flagged for organizers)
+- red "Not on roster"
+
+The phone remembers the mode per event, and switching events goes back to Check-in. The roster tabs' Check in buttons always check in. Offline, scans are saved like check-ins and deduped against the scan types' saved lists and what's waiting to sync.
+
+## Not on the roster, walk-ins and ID
+
+A code or email that doesn't check in is looked up (`lookup_not_on_roster`): waitlisted (asked for a spot / offered one), marked no-show, not accepted, never applied, or another event. For a waitlisted hacker or a no-show, **Accept walk-in** / **Let in** (with a confirm) calls `accept_walk_in` and checks them in straight away if there's an open spot, or says "No open spots". Walk-ins need a connection.
+
+A fresh check-in shows the school (hackers) or organization, and for hackers "18+", amber "Check ID: age unknown" or red "Under 18". The age is worked out by the database from the application's birthdate and the event's start date; the birthdate itself never reaches the desk.
 
 ## Liability waiver
 

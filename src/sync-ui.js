@@ -4,7 +4,8 @@
 //   Offline · 3       amber: no connection (with or without waiting items)
 //   Syncing 3…        sending the queue
 //   3 waiting         amber: online, but the server isn't answering yet
-//   1 needs attention red: the server said "not on roster" for a saved scan
+//   1 needs attention red: the server wouldn't take a saved item (not on
+//                     roster, checked in again since an undo, a no-show)
 //   Synced ✓          green for a moment after the queue empties, then hidden
 
 import { queue, isOffline } from "./offline.js";
@@ -88,7 +89,7 @@ export function mountSyncUI({ onSyncNow, onRetry, onDismiss, getRosterSavedAt, s
     if (queue.flushing) text = "Sending to the server…";
     else if (isOffline()) text = pending.length ? "No connection. These are saved on this phone and sync on their own when it's back." : "No connection. Check-ins are saved on this phone and sync when it's back.";
     else if (pending.length) text = `The server isn't answering yet${queue.lastError ? ` (${queue.lastError})` : ""}. Trying again on its own.`;
-    else if (attention.length) text = "Synced. The server couldn't match these: check the pass, then dismiss.";
+    else if (attention.length) text = "Synced. The server didn't take these: check each one, then dismiss.";
     else text = "Everything on this phone is synced.";
     status.textContent = text + savedText;
     // Offline it couldn't do anything: the queue sends on its own once back.
@@ -100,7 +101,14 @@ export function mountSyncUI({ onSyncNow, onRetry, onDismiss, getRosterSavedAt, s
       ? rows
           .map((i) => {
             const sending = i.id === queue.inFlight;
-            const what = i.op === "undo" ? "Undo" : i.unverified ? "Check-in · not in saved roster" : "Check-in";
+            const what =
+              i.op === "undo"
+                ? "Undo"
+                : i.op === "scan"
+                  ? `${i.label || "Scan"}${i.unverified ? " · not in saved roster" : ""}`
+                  : i.unverified
+                    ? "Check-in · not in saved roster"
+                    : "Check-in";
             const label = i.state === "attention" ? esc(i.error || "Needs attention") : sending ? "Sending…" : `${what} · ${timeOf(i.at)}`;
             const actions =
               i.state === "attention"
