@@ -3,6 +3,22 @@ import { QrScanner, prewarm as prewarmScanner } from "./scanner.js";
 import { feedback, unlockAudio, isMuted, setMuted } from "./feedback.js";
 import { searchIndex, searchPeople, compareAZ, compareNewestIn, VirtualList, LetterIndex } from "./roster.js";
 import { waiverState, waiverBadge, openWaiverSheet, syncWaiverSheet, isWaiverSheetOpen, prewarmWaiverQr } from "./waiver.js";
+import {
+  queue,
+  callRpc,
+  timedQuery,
+  isOffline,
+  onNetChange,
+  noteMaybeLanded,
+  saveRosterCache,
+  loadRosterCache,
+  saveEventsCache,
+  loadEventsCache,
+  clearUserCache,
+} from "./offline.js";
+import { requestPersistence } from "./offline-store.js";
+import { mountSyncUI, ICON_SAVED } from "./sync-ui.js";
+import { registerServiceWorker } from "./pwa.js";
 import "./style.css";
 
 // ---------- Phone shell: no page zoom, no page scroll ----------
@@ -75,6 +91,9 @@ let authUrlCleaned = false;
 // The result on the status card, and the scans before it (newest first).
 let currentScan = null;
 let recentScans = [];
+// When the roster on screen last came from the server (it may be the copy
+// saved on this phone while offline).
+let rosterSyncedAt = null;
 
 // An OAuth error (e.g. the person closed the Google screen) comes back in the
 // query string or hash. supabase-js only consumes successful sign-ins, so read
@@ -212,6 +231,8 @@ function normalizeRow(row) {
     at: formatTime(row.checked_in_at),
     // "signed" | "missing" | "unknown" (database without attendees.waiver_signed_at yet).
     waiver: waiverState(row),
+    // The row as the database sent it, for the copy saved on this phone.
+    row,
   };
   person.search = searchIndex(person);
   return person;
@@ -242,9 +263,56 @@ function syncWaiverViews() {
 function patchPerson(code, checkedInAt) {
   const p = rosterByCode.get(String(code || "").toUpperCase());
   if (!p) return;
+  setPersonIn(p, checkedInAt);
+  persistRosterSoon();
+}
+
+function setPersonIn(p, checkedInAt) {
   p.checked_in = !!checkedInAt;
   p.checked_in_at = checkedInAt || null;
   p.at = formatTime(checkedInAt);
+}
+
+// ---------- Offline: saved roster + check-ins waiting to sync ----------
+
+// The op saved on this phone for a code in this event, if any.
+function savedOp(code) {
+  return eventId ? queue.latestFor(eventId, code) : null;
+}
+
+function isSavedCheckIn(code) {
+  return savedOp(code)?.op === "check_in";
+}
+
+// Check-ins / undos saved on this phone win over whatever roster we loaded.
+function applyQueueOverlay() {
+  queue.pending.forEach((i) => {
+    if (i.eventId !== eventId) return;
+    const p = rosterByCode.get(i.code);
+    if (!p) return;
+    if (i.op === "check_in" && !p.checked_in) setPersonIn(p, i.at);
+    else if (i.op === "undo" && p.checked_in) setPersonIn(p, null);
+  });
+}
+
+const rowForCache = (p) => ({ ...p.row, checked_in_at: p.checked_in_at || null });
+
+let cacheTimer = null;
+function persistRosterSoon(delay = 800) {
+  clearTimeout(cacheTimer);
+  const userId = sessionUserId;
+  const ev = eventId;
+  if (!userId || !ev || rosterLoading) return;
+  cacheTimer = setTimeout(() => {
+    if (userId !== sessionUserId || ev !== eventId || rosterLoading) return;
+    saveRosterCache(userId, ev, roster.map(rowForCache), rosterSyncedAt);
+  }, delay);
+}
+
+function queryError(res) {
+  const err = new Error(res.message || "Request failed");
+  err.transient = res.kind === "transient";
+  return err;
 }
 
 function readStoredEventId(userId) {
@@ -273,31 +341,30 @@ function compareEvents(a, b) {
 }
 
 async function loadOrganizerEvents(userId) {
-  const { data, error } = await supabase
-    .from("event_roles")
-    .select("created_at, events(id, name, code, starts_at)")
-    .eq("user_id", userId)
-    .eq("role", "organizer");
-
-  if (error) throw error;
+  const res = await timedQuery(() =>
+    supabase.from("event_roles").select("created_at, events(id, name, code, starts_at)").eq("user_id", userId).eq("role", "organizer")
+  );
+  if (res.kind !== "ok") throw queryError(res);
+  const data = res.data;
   const byId = new Map();
   (data || []).forEach((row) => {
     const event = row.events;
     if (!event?.id || !event.code || byId.has(event.id)) return;
     byId.set(event.id, { ...event, role_created_at: row.created_at });
   });
-  return [...byId.values()].sort(compareEvents);
+  const list = [...byId.values()].sort(compareEvents);
+  saveEventsCache(userId, list);
+  return list;
 }
 
 // The pre-picker behaviour: VITE_EVENT_ID if set, else the newest event with a code.
 async function loadFallbackEvent() {
-  let query = supabase.from("events").select("id, name, starts_at, code");
-  query = FALLBACK_EVENT_ID
-    ? query.eq("id", FALLBACK_EVENT_ID)
-    : query.order("starts_at", { ascending: false, nullsFirst: false });
-  const { data, error } = await query;
-
-  if (error) throw error;
+  const res = await timedQuery(() => {
+    const query = supabase.from("events").select("id, name, starts_at, code");
+    return FALLBACK_EVENT_ID ? query.eq("id", FALLBACK_EVENT_ID) : query.order("starts_at", { ascending: false, nullsFirst: false });
+  });
+  if (res.kind !== "ok") throw queryError(res);
+  const data = res.data;
   if (!data?.length) {
     throw new Error(
       FALLBACK_EVENT_ID ? `No event with id ${FALLBACK_EVENT_ID} (VITE_EVENT_ID).` : 'No rows in the "events" table.'
@@ -343,11 +410,27 @@ function renderEventPicker() {
 async function loadEvent(userId) {
   let list = [];
   let listLoaded = false;
-  try {
-    list = await loadOrganizerEvents(userId);
-    listLoaded = true;
-  } catch (err) {
-    console.error("Couldn't load organizer events; using fallback event", err);
+  // No connection: the events this organizer had last time, straight away.
+  if (isOffline()) {
+    const cached = await loadEventsCache(userId);
+    if (cached) {
+      list = cached;
+      listLoaded = true;
+    }
+  }
+  if (!listLoaded) {
+    try {
+      list = await loadOrganizerEvents(userId);
+      listLoaded = true;
+    } catch (err) {
+      const cached = err.transient ? await loadEventsCache(userId) : null;
+      if (cached) {
+        list = cached;
+        listLoaded = true;
+      } else {
+        console.error("Couldn't load organizer events; using fallback event", err);
+      }
+    }
   }
 
   if (listLoaded && !list.length) return null;
@@ -416,26 +499,43 @@ let waiverColumn = true;
 const isMissingWaiverColumn = (error) =>
   error?.code === "42703" || error?.code === "PGRST204" || /waiver_signed_at/.test(error?.message || "");
 
+// Resolves to timedQuery's { kind: "ok" | "transient" | "error", ... }.
 async function fetchRoster(id) {
   if (waiverColumn) {
-    const res = await supabase.from("attendees").select(`${ROSTER_COLUMNS}, waiver_signed_at`).eq("event_id", id).order("code");
-    if (!res.error || !isMissingWaiverColumn(res.error)) return res;
+    const res = await timedQuery(() => supabase.from("attendees").select(`${ROSTER_COLUMNS}, waiver_signed_at`).eq("event_id", id).order("code"));
+    if (res.kind !== "error" || !isMissingWaiverColumn(res)) return res;
     waiverColumn = false;
   }
-  return supabase.from("attendees").select(ROSTER_COLUMNS).eq("event_id", id).order("code");
+  return timedQuery(() => supabase.from("attendees").select(ROSTER_COLUMNS).eq("event_id", id).order("code"));
 }
 
 async function loadRoster() {
   const requestedEventId = eventId;
-  const { data, error } = await fetchRoster(requestedEventId);
-
-  if (error) throw error;
+  const userId = sessionUserId;
+  const res = await fetchRoster(requestedEventId);
   // The organizer switched events while this was in flight.
   if (requestedEventId !== eventId) return;
-  setRoster((data || []).map(normalizeRow));
+
+  if (res.kind === "ok") {
+    rosterSyncedAt = new Date().toISOString();
+    setRoster((res.data || []).map(normalizeRow));
+    applyQueueOverlay();
+    saveRosterCache(userId, requestedEventId, roster.map(rowForCache), rosterSyncedAt);
+  } else {
+    // A refresh that failed keeps the roster on screen.
+    if (!rosterLoading) throw queryError(res);
+    // First load with no connection: the roster saved on this phone.
+    const cached = res.kind === "transient" ? await loadRosterCache(userId, requestedEventId) : null;
+    if (requestedEventId !== eventId) return;
+    if (!cached) throw queryError(res);
+    rosterSyncedAt = cached.syncedAt;
+    setRoster(cached.rows.map(normalizeRow));
+    applyQueueOverlay();
+  }
   rosterLoading = false;
   renderActiveRoleView();
   renderRecent();
+  syncUI.render();
 }
 
 // One roster fetch at a time; calls while one is in flight run once after it.
@@ -492,10 +592,14 @@ function applyRealtime(payload) {
     if (i >= 0) roster[i] = next;
     else roster.push(next);
     setRoster(roster);
+    // Another desk's update doesn't undo a check-in saved on this phone.
+    applyQueueOverlay();
     scheduleRosterRender();
+    persistRosterSoon();
   } else if (type === "DELETE" && payload.old?.id) {
     setRoster(roster.filter((p) => p.id !== payload.old.id));
     scheduleRosterRender();
+    persistRosterSoon();
   } else {
     scheduleReload();
   }
@@ -506,6 +610,7 @@ async function subscribeAttendees() {
     await supabase.removeChannel(attendeesChannel);
     attendeesChannel = null;
   }
+  let dropped = false;
   attendeesChannel = supabase
     .channel(`attendees:${eventId}`)
     .on(
@@ -518,7 +623,17 @@ async function subscribeAttendees() {
       },
       (payload) => applyRealtime(payload)
     )
-    .subscribe();
+    .subscribe((status) => {
+      // Back after a drop: changes from other desks may have been missed.
+      if (status === "SUBSCRIBED") {
+        if (dropped) {
+          dropped = false;
+          scheduleReload(200);
+        }
+      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+        dropped = true;
+      }
+    });
 }
 
 function resolveCode(raw) {
@@ -541,6 +656,10 @@ const BAND = {
   success: { icon: "✓", label: "Checked in" },
   warning: { icon: "↺", label: "Already in" },
   error: { icon: "✕", label: "Not on roster" },
+  // Offline, and the code isn't in the roster saved on this phone.
+  unverified: { icon: "?", label: "Can't verify offline", card: "warning" },
+  // ...and the organizer saved it anyway.
+  "saved-unverified": { icon: "?", label: "Saved · will verify", card: "warning" },
 };
 
 function renderCard(kind, html, { quiet = false } = {}) {
@@ -580,28 +699,36 @@ function setFailure(title, detail) {
 
 function showScan(scan, { quiet = false } = {}) {
   const band = BAND[scan.kind];
-  const undo =
-    scan.kind === "success"
-      ? `<button class="undo-btn" type="button" data-card-undo="${escapeHtml(scan.code)}" aria-label="Undo check-in for ${escapeHtml(scan.name)}">Undo</button>`
-      : "";
-  const metaParts =
-    scan.kind === "error"
-      ? [scan.hint]
-      : [scan.roleText, scan.team, scan.kind === "warning" ? "no action taken" : ""].filter(Boolean);
+  const unknown = scan.kind === "error" || scan.kind === "unverified" || scan.kind === "saved-unverified";
+  let action = "";
+  if (scan.kind === "success" || scan.kind === "saved-unverified") {
+    action = `<button class="undo-btn" type="button" data-card-undo="${escapeHtml(scan.code)}" aria-label="Undo check-in for ${escapeHtml(scan.name)}">Undo</button>`;
+  } else if (scan.kind === "unverified") {
+    action = `<button class="undo-btn" type="button" data-card-save="${escapeHtml(scan.code)}" aria-label="Save ${escapeHtml(scan.code)} anyway; it's checked against the roster when back online">Save anyway</button>`;
+  }
+  const metaParts = unknown
+    ? [scan.hint]
+    : [scan.roleText, scan.team, scan.kind === "warning" ? (scan.otherDesk ? "checked in at another desk" : "no action taken") : ""].filter(Boolean);
   // Waiver on file or not (nothing when the database can't say). It sits at the
   // end of the meta line and never truncates; the code goes short to make room.
-  const waiver = scan.kind === "error" ? "" : waiverBadge(scan.waiver, { code: scan.code, name: scan.name, button: true });
+  // Offline, it comes from the roster saved on this phone.
+  const waiver = unknown ? "" : waiverBadge(scan.waiver, { code: scan.code, name: scan.name, button: true });
   const code = waiver ? shortCode(scan.code) : scan.code;
+  // Saved on this phone: a quiet cloud-and-clock mark instead of the time.
+  const bandRight = scan.pending
+    ? `<span class="band-saved">${ICON_SAVED}<span class="band-saved-long">Saved on phone · will sync</span><span class="band-saved-short">Will sync</span></span>`
+    : escapeHtml(scan.bandRight);
+  const savedNote = scan.pending ? `<span class="visually-hidden">Saved on this phone, will sync.</span>` : "";
   renderCard(
-    scan.kind,
-    `<div class="band"><span class="band-title"><span aria-hidden="true">${band.icon}</span> ${band.label}</span><span class="band-time">${escapeHtml(scan.bandRight)}</span></div>
+    band.card || scan.kind,
+    `<div class="band"><span class="band-title"><span aria-hidden="true">${band.icon}</span> ${band.label}</span><span class="band-time">${bandRight}</span>${savedNote}</div>
      <div class="body">
-       <div class="avatar role-${scan.role}" aria-hidden="true">${escapeHtml(scan.kind === "error" ? "?" : initials(scan.name))}</div>
+       <div class="avatar role-${unknown ? "none" : scan.role}" aria-hidden="true">${escapeHtml(unknown ? "?" : initials(scan.name))}</div>
        <div class="who">
-         <div class="name">${escapeHtml(scan.kind === "error" ? "Unknown code" : scan.name)}</div>
+         <div class="name">${escapeHtml(scan.kind === "error" ? "Unknown code" : unknown ? "Not found" : scan.name)}</div>
          <div class="meta"><code title="${escapeHtml(scan.code)}">${escapeHtml(code)}</code><span class="meta-text">${metaParts.map((p) => ` · ${escapeHtml(p)}`).join("")}</span>${waiver}</div>
        </div>
-       ${undo}
+       ${action}
      </div>`,
     { quiet }
   );
@@ -624,19 +751,25 @@ function renderRecent() {
   list.innerHTML = recentScans
     .map((scan) => {
       const person = rosterByCode.get(scan.code);
-      const undone = scan.kind !== "error" && person && !person.checked_in;
-      const kind = undone ? "undone" : scan.kind;
+      const unknown = scan.kind === "error" || scan.kind === "unverified" || scan.kind === "saved-unverified";
+      const undone =
+        (scan.kind === "saved-unverified" && !savedOp(scan.code)) || (!unknown && person && !person.checked_in);
+      const kind = undone ? "undone" : unknown && scan.kind !== "error" ? "warning" : scan.kind;
       const status =
         kind === "undone"
           ? `<span class="t">undone</span>`
           : kind === "error"
             ? `<span class="t"><span aria-hidden="true">✕</span><span class="visually-hidden">Unknown code,</span> ${escapeHtml(scan.timeShort)}</span>`
-            : kind === "warning"
-              ? `<span class="t"><span aria-hidden="true">↺</span><span class="visually-hidden">Already in since</span> ${escapeHtml(scan.inShort || scan.timeShort)}</span>`
-              : `<span class="t"><span aria-hidden="true">✓</span><span class="visually-hidden">Checked in</span> ${escapeHtml(scan.inShort || scan.timeShort)}</span>`;
-      return `<li class="recent-row is-${kind}">
-        <span class="sq role-${scan.role}" aria-hidden="true"></span>
-        <span class="nm">${escapeHtml(scan.kind === "error" ? "Unknown code" : scan.name)}</span>
+            : unknown
+              ? `<span class="t">${scan.kind === "saved-unverified" ? ICON_SAVED : `<span aria-hidden="true">?</span>`}<span class="visually-hidden">${scan.kind === "saved-unverified" ? "Saved on this phone, not verified," : "Couldn't verify offline,"}</span> ${escapeHtml(scan.timeShort)}</span>`
+              : kind === "warning"
+                ? `<span class="t"><span aria-hidden="true">↺</span><span class="visually-hidden">Already in since</span> ${escapeHtml(scan.inShort || scan.timeShort)}</span>`
+                : scan.pending
+                  ? `<span class="t">${ICON_SAVED}<span class="visually-hidden">Saved on this phone, will sync, checked in</span> ${escapeHtml(scan.inShort || scan.timeShort)}</span>`
+                  : `<span class="t"><span aria-hidden="true">✓</span><span class="visually-hidden">Checked in</span> ${escapeHtml(scan.inShort || scan.timeShort)}</span>`;
+      return `<li class="recent-row is-${kind}${scan.pending ? " is-pending" : ""}">
+        <span class="sq role-${unknown ? "none" : scan.role}" aria-hidden="true"></span>
+        <span class="nm">${escapeHtml(scan.kind === "error" ? "Unknown code" : unknown ? "Not verified" : scan.name)}</span>
         <code>${escapeHtml(shortCode(scan.code))}</code>${status}</li>`;
     })
     .join("");
@@ -658,6 +791,65 @@ function announce(kind) {
   feedback(kind);
 }
 
+function scanBase(code, person, at) {
+  return {
+    code,
+    name: person?.name || code,
+    role: roleKey(person?.roles),
+    roleText: roleText(person?.roles),
+    team: person?.team || "",
+    timeShort: formatTimeShort(new Date().toISOString()),
+    inShort: formatTimeShort(at),
+    roles: Array.isArray(person?.roles) ? person.roles : [],
+    // Offline: waiver from the roster saved on this phone.
+    waiver: person?.waiver || "unknown",
+  };
+}
+
+function eventCodeHint(code) {
+  const prefix = (code.match(/^([A-Z0-9]{2,10})-[HJMB]\d+$/) || [])[1] || "";
+  const eventCode = (currentEvent?.code || "").toUpperCase();
+  return { prefix, eventCode, wrongEvent: !!(prefix && eventCode && prefix !== eventCode) };
+}
+
+// No answer from the server: decide with the roster saved on this phone.
+// maybeSentAt: when the request that failed went out (it may have landed).
+async function checkInOffline(raw, code, maybeSentAt = null) {
+  const p = rosterByCode.get(code);
+  if (!p) {
+    const { prefix, eventCode, wrongEvent } = eventCodeHint(code);
+    const hint = wrongEvent ? `this pass is for ${prefix}, not ${eventCode}` : rosterSyncedAt ? `roster saved ${formatTime(rosterSyncedAt)}` : "no saved roster";
+    pushScan({ ...scanBase(code, null), kind: "unverified", hint, bandRight: eventCode, maybeSentAt });
+    announce("warning");
+    return { status: "unverified", message: `Can't verify "${raw}" offline` };
+  }
+  if (p.checked_in) {
+    const since = formatTime(p.checked_in_at);
+    pushScan({ ...scanBase(code, p, p.checked_in_at), kind: "warning", pending: isSavedCheckIn(code), bandRight: since ? `since ${since}` : "" });
+    announce("warning");
+    return { status: "dupe", name: p.name, code, checked_in_at: p.checked_in_at };
+  }
+  const fields = { op: "check_in", eventId, code, name: p.name, roles: p.roles, team: p.team || "" };
+  if (maybeSentAt) noteMaybeLanded(fields, maybeSentAt);
+  const item = await queue.add(fields);
+  patchPerson(code, item.at);
+  pushScan({ ...scanBase(code, p, item.at), kind: "success", pending: true, bandRight: formatTimeSeconds(new Date(item.at)) });
+  announce("success");
+  return { status: "ok", queued: true, name: p.name, code, checked_in_at: item.at };
+}
+
+// "Save anyway" on a code that isn't in the saved roster: the server decides later.
+async function saveUnverified(code) {
+  const scan = currentScan?.code === code && currentScan.kind === "unverified" ? currentScan : null;
+  if (!scan || savedOp(code)) return;
+  const fields = { op: "check_in", eventId, code, name: code, roles: [], team: "", unverified: true };
+  if (scan.maybeSentAt) noteMaybeLanded(fields, scan.maybeSentAt);
+  await queue.add(fields);
+  Object.assign(scan, { kind: "saved-unverified", hint: "checked against the roster once online" });
+  showScan(scan);
+  renderRecent();
+}
+
 async function processCode(rawText) {
   const raw = String(rawText || "").trim();
   const code = resolveCode(raw);
@@ -667,19 +859,35 @@ async function processCode(rawText) {
   lastScanId = code;
   lastScanTime = now;
 
+  // Something for this code is already saved on this phone: settle it here,
+  // in order, rather than racing the queue to the server.
+  const saved = savedOp(code);
+  if (saved?.op === "check_in") return checkInOffline(raw, code);
+  if (saved?.op === "undo" && saved.id !== queue.inFlight) {
+    // Checked in on the server, undone on this phone, back again: drop the undo.
+    await queue.remove(saved.id);
+    const p = rosterByCode.get(code);
+    patchPerson(code, saved.prevAt || new Date().toISOString());
+    pushScan({ ...scanBase(code, p, saved.prevAt), kind: "success", bandRight: formatTimeSeconds(new Date()) });
+    announce("success");
+    renderActiveRoleView();
+    return { status: "ok", name: p?.name || code, code };
+  }
+  if (saved || isOffline()) return checkInOffline(raw, code);
+
   setInfo(`Looking up ${code}…`, "Checking");
 
-  const { data, error } = await supabase.rpc("check_in_by_code", {
-    p_event_id: eventId,
-    p_code: code,
-  });
+  const sentAt = new Date().toISOString();
+  const result = await callRpc("check_in_by_code", { p_event_id: eventId, p_code: code });
 
-  if (error) {
-    setFailure("Check-in failed", error.message || error);
+  if (result.kind === "transient") return checkInOffline(raw, code, result.maybeSent ? sentAt : null);
+  if (result.kind === "error") {
+    setFailure("Check-in failed", result.message);
     announce("error");
-    return { status: "error", message: error.message || String(error) };
+    return { status: "error", message: result.message };
   }
 
+  const data = result.data;
   const status = data?.status;
   const scannedAt = new Date();
   const base = {
@@ -696,15 +904,11 @@ async function processCode(rawText) {
   };
 
   if (status === "unknown") {
-    const prefix = (code.match(/^([A-Z0-9]{2,10})-[HJMB]\d+$/) || [])[1] || "";
-    const eventCode = (currentEvent?.code || "").toUpperCase();
-    const hint =
-      prefix && eventCode && prefix !== eventCode
-        ? `this pass is for ${prefix}, not ${eventCode}`
-        : `not on the ${eventCode} roster`;
+    const { prefix, eventCode, wrongEvent } = eventCodeHint(code);
+    const hint = wrongEvent ? `this pass is for ${prefix}, not ${eventCode}` : `not on the ${eventCode} roster`;
     pushScan({ ...base, kind: "error", code, role: "none", hint, bandRight: eventCode });
     announce("error");
-    return { status: "unknown", message: prefix && prefix !== eventCode ? `This code is for ${prefix}, but you're checking in to ${eventCode}.` : `"${raw}" is not on the ${eventCode} attendees roster` };
+    return { status: "unknown", message: wrongEvent ? `This code is for ${prefix}, but you're checking in to ${eventCode}.` : `"${raw}" is not on the ${eventCode} attendees roster` };
   }
 
   if (status === "dupe") {
@@ -725,14 +929,41 @@ async function processCode(rawText) {
 }
 
 async function undoCode(code) {
-  const { data, error } = await supabase.rpc("undo_check_in", {
-    p_event_id: eventId,
-    p_code: code,
-  });
-  if (error) {
-    setFailure("Undo failed", error.message || error);
-    return { status: "error", message: error.message || String(error) };
+  const person = rosterByCode.get(code);
+  const name = person?.name || code;
+  const saved = savedOp(code);
+
+  // Not synced yet: just take it off this phone.
+  if (saved?.op === "check_in" && saved.id !== queue.inFlight) {
+    await queue.remove(saved.id);
+    patchPerson(code, null);
+    if (currentScan?.code === code) currentScan = null;
+    setInfo(`Undid check-in for ${name}. It hadn't synced yet.`, "Undone");
+    renderRecent();
+    return { status: "ok", name, code, local: true };
   }
+  if (saved?.op === "undo") return { status: "ok", name, code, queued: true };
+
+  const queueUndo = async (maybeSentAt) => {
+    const fields = { op: "undo", eventId, code, name, roles: person?.roles || [], team: person?.team || "", prevAt: person?.checked_in_at || null };
+    if (maybeSentAt) noteMaybeLanded(fields, maybeSentAt);
+    await queue.add(fields);
+    patchPerson(code, null);
+    if (currentScan?.code === code) currentScan = null;
+    setInfo(`Undid check-in for ${name}. Saved on this phone, will sync.`, "Undone");
+    renderRecent();
+    return { status: "ok", name, code, queued: true };
+  };
+  if (saved || isOffline()) return queueUndo(null);
+
+  const sentAt = new Date().toISOString();
+  const result = await callRpc("undo_check_in", { p_event_id: eventId, p_code: code });
+  if (result.kind === "transient") return queueUndo(result.maybeSent ? sentAt : null);
+  if (result.kind === "error") {
+    setFailure("Undo failed", result.message);
+    return { status: "error", message: result.message };
+  }
+  const data = result.data;
   if (data?.status === "ok") {
     // An undone scan doesn't belong in the recent list.
     if (currentScan?.code === data.code) currentScan = null;
@@ -761,7 +992,7 @@ function roleLabelFor(p, role) {
 
 function rowSignature(it) {
   const p = it.person;
-  return `${p.id}|${p.name}|${p.team}|${p.checked_in_at || ""}|${p.waiver}|${rowState.get(p.id) || ""}`;
+  return `${p.id}|${p.name}|${p.team}|${p.checked_in_at || ""}|${p.waiver}|${rowState.get(p.id) || ""}|${isSavedCheckIn(p.code) ? "saved" : ""}`;
 }
 
 function renderPersonRow(el, it, role) {
@@ -775,6 +1006,9 @@ function renderPersonRow(el, it, role) {
     action = `<button class="primary row-checkin" type="button" disabled>Checking…</button>`;
   } else if (isIn && (state === "done" || state === "leaving")) {
     action = `<span class="in-badge"><span aria-hidden="true">✓</span> Checked in</span>`;
+  } else if (isIn && isSavedCheckIn(p.code)) {
+    action = `<span class="in-time is-saved" title="Saved on this phone, will sync">${ICON_SAVED}<span class="visually-hidden">Saved on this phone, will sync. Checked in at</span> ${escapeHtml(time || "")}</span>
+       <button class="row-undo" type="button" data-undo="${escapeHtml(p.code)}" aria-label="Undo check-in for ${escapeHtml(p.name)}">Undo</button>`;
   } else if (isIn) {
     action = `<span class="in-time" title="Checked in ${escapeHtml(p.checked_in_at ? new Date(p.checked_in_at).toLocaleString() : "")}"><span aria-hidden="true">✓</span><span class="visually-hidden">Checked in at</span> ${escapeHtml(time || "")}</span>
        <button class="row-undo" type="button" data-undo="${escapeHtml(p.code)}" aria-label="Undo check-in for ${escapeHtml(p.name)}">Undo</button>`;
@@ -948,7 +1182,8 @@ async function rosterCheckIn(code) {
     rowState.set(p.id, "done");
     renderActiveRoleView();
     if (result.status === "ok") {
-      toast(`Checked in ${result.name || p.name}`, "success", { label: "Undo", run: () => toastUndo(code) });
+      const who = result.name || p.name;
+      toast(result.queued ? `Checked in ${who} · saved on phone` : `Checked in ${who}`, "success", { label: "Undo", run: () => toastUndo(code) });
     } else {
       toast(`${result.name || p.name} was already checked in`, "warning");
     }
@@ -977,7 +1212,11 @@ async function toastUndo(code) {
   if (lastScanId === code) lastScanId = null;
   const result = await undoCode(code);
   renderActiveRoleView({ animate: true });
-  if (result?.status === "ok") toast(`Undid check-in for ${result.name || result.code}`);
+  toastUndoResult(result);
+}
+
+function toastUndoResult(result) {
+  if (result?.status === "ok") toast(`Undid check-in for ${result.name || result.code}${result.queued ? " · will sync" : ""}`);
   else toast(result?.message || "Undo failed", "error");
 }
 
@@ -990,8 +1229,7 @@ async function rosterUndo(btn) {
   if (lastScanId === code) lastScanId = null;
   const result = await undoCode(code);
   renderActiveRoleView({ animate: true });
-  if (result?.status === "ok") toast(`Undid check-in for ${result.name || result.code}`);
-  else toast(result?.message || "Undo failed", "error");
+  toastUndoResult(result);
   if (btn.isConnected) btn.disabled = false;
 }
 
@@ -1281,10 +1519,19 @@ document.getElementById("status-card").addEventListener("click", async (e) => {
     openWaiverSheet({ code, name: scan?.name || p?.name || code, roles: scan?.roles?.length ? scan.roles : p?.roles || [], waiver: p?.waiver || scan?.waiver || "missing" });
     return;
   }
+  const save = e.target.closest("button[data-card-save]");
+  if (save) {
+    save.disabled = true;
+    await saveUnverified(save.dataset.cardSave);
+    return;
+  }
   const btn = e.target.closest("button[data-card-undo]");
   if (!btn) return;
   btn.disabled = true;
-  await undoCode(btn.dataset.cardUndo);
+  const code = btn.dataset.cardUndo;
+  if (lastScanId === code) lastScanId = null;
+  await undoCode(code);
+  renderActiveRoleView();
   if (btn.isConnected) btn.disabled = false;
 });
 
@@ -1361,12 +1608,38 @@ document.getElementById("login-form").addEventListener("submit", async (e) => {
 });
 
 document.getElementById("sign-out-btn").addEventListener("click", async () => {
+  const unsynced = queue.items.length;
+  if (
+    unsynced &&
+    !window.confirm(
+      `${unsynced === 1 ? "1 check-in" : `${unsynced} check-ins`} on this phone ${unsynced === 1 ? "hasn't" : "haven't"} synced yet.\n\nSigning out deletes ${unsynced === 1 ? "it" : "them"}. Sign out anyway?`
+    )
+  ) {
+    return;
+  }
   stopCamera();
+  const userId = sessionUserId;
   if (attendeesChannel) {
     await supabase.removeChannel(attendeesChannel);
     attendeesChannel = null;
   }
-  await supabase.auth.signOut();
+  // Nothing of this organizer's stays on the phone.
+  await queue.clear(userId);
+  queue.unload();
+  await clearUserCache(userId);
+  const { error } = await supabase.auth.signOut();
+  if (error) {
+    // Offline: end the session on this phone only.
+    const { error: localError } = await supabase.auth.signOut({ scope: "local" });
+    if (localError) {
+      try {
+        localStorage.removeItem(supabase.auth.storageKey);
+      } catch {
+        /* ignore */
+      }
+      signedOut();
+    }
+  }
 });
 
 // Signed in, but not an organizer of any event: sign out on this device only
@@ -1392,12 +1665,20 @@ async function startSession(session) {
     }
     setSessionEmail(session.user.email || "");
     showBoot("Loading roster…");
+    requestPersistence();
+    // Check-ins saved on this phone apply over the roster as it loads.
+    await queue.load(userId);
+    if (sessionUserId !== userId) return;
     await loadRoster();
     await subscribeAttendees();
     showApp();
+    syncUI.render();
+    if (queue.pending.length) queue.flushSoon();
     // Fetch the QR decoder in the background so Start camera is instant.
     (window.requestIdleCallback || ((fn) => setTimeout(fn, 200)))(() => prewarmScanner());
-    if (roster.length === 0) {
+    if (isOffline() && rosterSyncedAt) {
+      setInfo(`No connection. Using the roster saved at ${formatTime(rosterSyncedAt)}; check-ins sync when it's back.`, "Offline");
+    } else if (roster.length === 0) {
       setInfo("Connected, but the attendees roster is empty. Accept applications after setting events.code so upsert_attendee can fill the table.", "Empty roster");
     } else {
       clearCard();
@@ -1410,19 +1691,166 @@ async function startSession(session) {
   }
 }
 
-supabase.auth.onAuthStateChange((_event, session) => {
+// ---------- Offline: sync pill, queue results, reconnect ----------
+
+const syncUI = mountSyncUI({
+  onSyncNow: () => queue.flushSoon(),
+  onRetry: (id) => queue.retry(id),
+  onDismiss: async (id) => {
+    const item = queue.items.find((i) => i.id === id);
+    await queue.remove(id);
+    if (item) toast(`Dismissed ${item.name || item.code}`);
+  },
+  getRosterSavedAt: () => rosterSyncedAt,
+  shortCode,
+});
+
+// The server answered a check-in / undo that was saved on this phone.
+queue.onSettled = (item, outcome, data) => {
+  if (item.eventId !== eventId) return;
+  const scans = [currentScan, ...recentScans].filter((s) => s && s.code === item.code && (s.pending || s.kind === "saved-unverified"));
+  if (item.op === "check_in") {
+    if (outcome === "synced") {
+      patchPerson(item.code, data?.checked_in_at || item.at);
+      scans.forEach((s) => {
+        if (s.kind === "saved-unverified") {
+          Object.assign(s, {
+            kind: "success",
+            name: data?.name || s.name,
+            role: roleKey(data?.roles),
+            roleText: roleText(data?.roles),
+            roles: Array.isArray(data?.roles) ? data.roles : [],
+            team: data?.team || "",
+            waiver: data && "waiver_signed_at" in data ? waiverState(data) : rosterByCode.get(item.code)?.waiver || "unknown",
+          });
+        }
+        s.pending = false;
+        s.inShort = formatTimeShort(data?.checked_in_at) || s.inShort;
+        if (s.kind === "success" && data?.checked_in_at) s.bandRight = formatTimeSeconds(new Date(data.checked_in_at));
+      });
+    } else if (outcome === "already") {
+      // Another desk got them first: nothing to do but say so in Recent.
+      patchPerson(item.code, data?.checked_in_at || null);
+      const since = formatTime(data?.checked_in_at);
+      const already = { kind: "warning", pending: false, otherDesk: true, bandRight: since ? `since ${since}` : "", inShort: formatTimeShort(data?.checked_in_at) };
+      if (scans.length) {
+        scans.forEach((s) => Object.assign(s, already, { name: data?.name || s.name, role: roleKey(data?.roles), roleText: roleText(data?.roles) }));
+      } else {
+        const p = rosterByCode.get(item.code);
+        recentScans = [{ ...scanBase(item.code, p || { name: data?.name || item.name, roles: data?.roles }, data?.checked_in_at), ...already }, ...recentScans].slice(0, RECENT_MAX);
+      }
+    } else if (outcome === "attention") {
+      const p = rosterByCode.get(item.code);
+      if (p && p.checked_in_at === item.at) patchPerson(item.code, null);
+      scans.forEach((s) => Object.assign(s, { kind: "error", pending: false, role: "none", hint: "server says not on the roster" }));
+    }
+  } else if (outcome === "undone") {
+    const p = rosterByCode.get(item.code);
+    if (p && !savedOp(item.code)) patchPerson(item.code, null);
+  }
+  if (currentScan && scans.includes(currentScan)) showScan(currentScan, { quiet: true });
+  renderRecent();
+  scheduleRosterRender();
+};
+
+queue.onDrained = (synced) => {
+  if (synced) syncUI.flashSynced();
+  reloadRoster();
+};
+
+// Back online (or the server answered again): resubscribe to other desks'
+// changes, refetch the roster so everything converges, send what's waiting.
+let reconnectTimer = null;
+function reconnect() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    if (!sessionUserId || !eventId || rosterLoading) return;
+    queue.flushSoon();
+    subscribeAttendees().catch((err) => console.error(err));
+    reloadRoster();
+  }, 250);
+}
+
+onNetChange((reason) => {
+  syncUI.render();
+  if (reason === "online" || reason === "reconnected") reconnect();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible" || !sessionUserId) return;
+  if (queue.pending.length) queue.flushSoon();
+  else if (isOffline()) reloadRoster();
+});
+
+// Connected to Wi-Fi but the server isn't answering, nothing waiting: check
+// every 15 s so the pill clears (and the roster catches up) once it's back.
+// With items waiting, the queue's own retries do this.
+setInterval(() => {
+  if (!sessionUserId || !eventId || rosterLoading || queue.pending.length) return;
+  if (isOffline() && navigator.onLine !== false) reloadRoster();
+}, 15000);
+
+registerServiceWorker({
+  onUpdateReady: (apply) => toast("A new version of Check-In is ready.", "", { label: "Reload", run: apply }),
+});
+
+function signedOut() {
+  eventId = null;
+  currentEvent = null;
+  events = [];
+  setRoster([]);
+  rosterLoading = true;
+  rosterSyncedAt = null;
+  currentScan = null;
+  recentScans = [];
+  renderRecent();
+  clearCard();
+  sessionUserId = null;
+  queue.unload();
+  syncUI.close();
+  setSessionEmail("");
+  resetGoogleButton();
+  showAuth();
+}
+
+// supabase-js reports no session at startup when the access token has
+// expired and it can't refresh it (no network), but it keeps the session in
+// storage for later. Use it so an organizer can keep checking people in; the
+// token refreshes once the connection is back.
+function storedSession() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(supabase.auth.storageKey) || "null");
+    return stored?.user?.id && stored.refresh_token ? stored : null;
+  } catch {
+    return null;
+  }
+}
+
+// With an expired token and no network, supabase-js keeps retrying the
+// refresh for ~30 s before it reports anything. Don't make the desk wait:
+// after a moment, carry on with the stored session.
+let authReported = false;
+if (storedSession()) {
+  showBoot("Restoring your session…");
+  const stored = storedSession();
+  if (!stored.expires_at || stored.expires_at * 1000 < Date.now() + 60000) {
+    setTimeout(() => {
+      const again = storedSession();
+      if (authReported || sessionUserId || !again) return;
+      sessionUserId = again.user.id;
+      startSession(again);
+    }, 2500);
+  }
+}
+
+supabase.auth.onAuthStateChange((event, session) => {
+  authReported = true;
   // The first event (INITIAL_SESSION) comes after supabase-js has finished
   // reading any sign-in result from the URL.
   cleanAuthUrl();
+  if (!session && event === "INITIAL_SESSION") session = storedSession();
   if (!session) {
-    eventId = null;
-    currentEvent = null;
-    events = [];
-    setRoster([]);
-    sessionUserId = null;
-    setSessionEmail("");
-    resetGoogleButton();
-    showAuth();
+    signedOut();
     return;
   }
   // Token refreshes and tab refocus re-emit the session; keep the selected event.
@@ -1432,3 +1860,4 @@ supabase.auth.onAuthStateChange((_event, session) => {
 });
 
 if (oauthError) setAuthError(`Google sign-in didn't finish: ${oauthError}`);
+

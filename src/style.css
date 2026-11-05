@@ -787,6 +787,96 @@ button.row-checkin{ min-width:100px; height:var(--tap); padding:0 16px; font-siz
 .toast.error::before{ background:var(--error); }
 
 /* ==========================================================================
+   Offline: sync pill (header), "saved on this phone" marks, and the sheet
+   ========================================================================== */
+.sync-pill{
+  position:relative; flex:none; display:inline-flex; align-items:center; gap:6px;
+  height:32px; padding:0 11px 0 9px; border-radius:var(--radius-pill); cursor:pointer;
+  font:600 12.5px/1 var(--font-ui); white-space:nowrap;
+  color:var(--warning); background:rgb(36 24 30 / .72); border:1px solid rgb(245 196 81 / .5);
+  box-shadow:inset 0 1px 0 rgb(255 255 255 / .1), var(--shadow-sm);
+  -webkit-backdrop-filter:var(--glass-blur); backdrop-filter:var(--glass-blur);
+  animation:card-in .2s var(--ease-out);
+}
+/* The pill is short; its hit area isn't. */
+.sync-pill::after{ content:""; position:absolute; inset:-6px -3px; }
+.sync-pill svg{ flex:none; }
+.sync-pill[data-state="syncing"]{ color:var(--pearl-hi); border-color:rgb(79 209 191 / .5); background:rgb(18 34 44 / .72); }
+.sync-pill[data-state="synced"]{ color:var(--success); border-color:rgb(78 224 138 / .5); background:rgb(18 36 30 / .72); }
+.sync-pill[data-state="attention"]{ color:var(--error); border-color:rgb(255 138 128 / .55); background:rgb(42 20 30 / .72); }
+.sync-pill .spin, .sheet-row.is-sending .sheet-ico svg{ animation:spin 1.1s linear infinite; }
+@keyframes spin{ to{ transform:rotate(360deg); } }
+.sync-pill-short{ display:none; }
+/* Phones: while the pill shows it takes the title's place, so neither the
+   event code nor the pill gets cut off. */
+@media (max-width: 719px){
+  .app-bar:has(.sync-pill:not([hidden])) .brand{ display:none; }
+  .sync-pill{ margin-right:auto; }
+}
+/* Narrow phones: "Offline · 3"; the sheet has the rest. */
+@media (max-width: 374px){
+  .sync-pill{ padding:0 9px 0 8px; gap:5px; }
+  .sync-pill-long{ display:none; }
+  .sync-pill-short{ display:inline; }
+}
+
+.saved-ico{ flex:none; display:inline-block; vertical-align:-2px; }
+.band-saved{
+  display:inline-flex; align-items:center; gap:5px;
+  font:600 12px/1 var(--font-ui); letter-spacing:0; text-transform:none;
+}
+.band-saved-short{ display:none; }
+@container shell (max-width: 340px){
+  .band-saved-long{ display:none; }
+  .band-saved-short{ display:inline; }
+}
+.recent-row .t{ display:inline-flex; align-items:center; gap:4px; }
+.in-time.is-saved{ display:inline-flex; align-items:center; gap:4px; }
+
+.sync-sheet{
+  position:fixed; inset:auto 0 0 0; margin:0; padding:0; border:0;
+  width:100%; max-width:100%; max-height:100%;
+  background:transparent; color:var(--text); overflow:visible;
+}
+.sync-sheet::backdrop{ background:rgb(10 5 20 / .6); }
+.sheet-panel{
+  display:flex; flex-direction:column; gap:12px;
+  width:min(100% - 2 * var(--gutter), 480px);
+  max-height:min(72dvh, 560px);
+  margin:0 auto calc(max(8px, env(safe-area-inset-bottom)) + 8px);
+  padding:16px 14px 14px 16px; border-radius:var(--radius-lg);
+  background:linear-gradient(180deg, var(--glass-glow), transparent 50%), var(--glass-fallback);
+  border:1px solid var(--glass-edge);
+  box-shadow:inset 0 1px 0 var(--glass-hi), var(--shadow);
+  animation:card-in .2s var(--ease-out);
+}
+.sheet-head{ display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.sheet-head h2{ font:400 13px/1 var(--font-display); letter-spacing:.06em; text-transform:uppercase; color:var(--text); }
+.sheet-close{ background:rgb(255 255 255 / .06); border:1px solid var(--glass-edge); width:40px; padding:0; }
+.sheet-status{ font:500 14px/1.45 var(--font-ui); color:var(--muted); }
+.sheet-list{
+  list-style:none; display:flex; flex-direction:column; gap:6px;
+  min-height:0; overflow-y:auto; overscroll-behavior:contain;
+}
+.sheet-row{
+  flex:none; display:flex; align-items:center; gap:10px; min-height:52px; padding:8px 10px 8px 12px; min-width:0;
+  border-radius:var(--radius-sm); background:var(--glass-solid);
+  box-shadow:inset 0 1px 0 rgb(255 255 255 / .1), inset 0 0 0 1px rgb(255 255 255 / .06);
+}
+.sheet-row.is-attention{ flex-wrap:wrap; box-shadow:inset 3px 0 0 var(--error), inset 0 0 0 1px rgb(255 138 128 / .25); }
+.sheet-ico{ flex:none; display:grid; place-items:center; color:var(--warning); }
+.sheet-row.is-sending .sheet-ico{ color:var(--pearl-hi); }
+.sheet-row.is-attention .sheet-ico{ color:var(--error); }
+.sheet-main{ flex:1; min-width:0; }
+.sheet-name{ font:600 15px/1.25 var(--font-ui); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.sheet-sub{ margin-top:2px; font:500 13px/1.3 var(--font-ui); color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.sheet-sub code{ font:600 12.5px/1 var(--font-mono); color:var(--muted); }
+.sheet-row.is-attention .sheet-sub{ color:var(--error); }
+.sheet-row-actions{ display:flex; gap:6px; margin-left:auto; }
+.sheet-row-actions button.ghost{ min-height:40px; padding:0 14px; font-size:13.5px; }
+.sheet-sync{ align-self:stretch; }
+
+/* ==========================================================================
    Tablets and desktop
    ========================================================================== */
 @media (min-width: 720px){
