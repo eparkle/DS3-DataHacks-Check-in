@@ -2,8 +2,45 @@ import { supabase } from "./supabase.js";
 import { QrScanner, prewarm as prewarmScanner } from "./scanner.js";
 import "./style.css";
 
+// ---------- Phone shell: no page zoom, no page scroll ----------
+// iOS Safari ignores user-scalable=no, so block its pinch gestures directly.
+// Double-tap zoom is handled by touch-action: manipulation in style.css.
+["gesturestart", "gesturechange", "gestureend"].forEach((type) => {
+  document.addEventListener(type, (e) => e.preventDefault(), { passive: false });
+});
+document.addEventListener(
+  "touchmove",
+  (e) => {
+    if (e.touches.length > 1 || (typeof e.scale === "number" && e.scale !== 1)) e.preventDefault();
+  },
+  { passive: false }
+);
+
+// Size the app to the visible area. With the on-screen keyboard open, iOS
+// shrinks only the visual viewport and pans the page; follow the visual
+// viewport so the field being typed in and the list above it stay on screen.
+function syncViewportHeight() {
+  const vv = window.visualViewport;
+  const height = vv ? vv.height : window.innerHeight;
+  document.documentElement.style.setProperty("--app-height", `${Math.round(height)}px`);
+  if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
+}
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", syncViewportHeight);
+  window.visualViewport.addEventListener("scroll", syncViewportHeight);
+}
+window.addEventListener("resize", syncViewportHeight);
+window.addEventListener("orientationchange", syncViewportHeight);
+syncViewportHeight();
+
 const ROLES = ["hacker", "judge", "mentor"];
 const ROLE_LABELS = { hacker: "Hackers", judge: "Judges", mentor: "Mentors" };
+const ROLE_SINGULAR = { hacker: "Hacker", judge: "Judge", mentor: "Mentor" };
+const STATUS_FILTERS = [
+  ["all", "All"],
+  ["out", "Not yet"],
+  ["in", "Checked in"],
+];
 // Only used when the organizer's events can't be loaded from event_roles.
 const FALLBACK_EVENT_ID = (import.meta.env.VITE_EVENT_ID || "").trim();
 const EVENT_STORAGE_PREFIX = "datahacks-checkin:event:";
@@ -11,6 +48,9 @@ const NOT_ORGANIZER_MESSAGE = "This Google account isn't an organizer. Ask a Dat
 const NOT_ORGANIZER_PASSWORD_MESSAGE = "This account isn't an organizer. Ask a DataHacks organizer to add you.";
 
 let roster = [];
+// True while the roster for the selected event is being fetched (first load, event switch).
+let rosterLoading = true;
+const statusFilter = { hacker: "all", judge: "all", mentor: "all" };
 let eventId = null;
 let currentEvent = null;
 let events = [];
@@ -95,6 +135,13 @@ function cleanAuthUrl() {
   if (url.href !== window.location.href) {
     window.history.replaceState(window.history.state, "", url.pathname + url.search);
   }
+}
+
+function setSessionEmail(email) {
+  document.getElementById("session-email").textContent = email;
+  const btn = document.getElementById("sign-out-btn");
+  btn.title = email ? `Signed in as ${email}` : "";
+  btn.setAttribute("aria-label", email ? `Sign out ${email}` : "Sign out");
 }
 
 function showApp() {
@@ -192,12 +239,15 @@ function renderEventPicker() {
   document.querySelectorAll(".current-event-code").forEach((el) => {
     el.textContent = currentEvent.code;
   });
-  document.querySelectorAll(".current-event-name").forEach((el) => {
-    el.textContent = usingFallback
-      ? `${currentEvent.name} (fallback: couldn't load the events you organize)`
-      : currentEvent.name;
-  });
-  document.querySelectorAll(".event-banner").forEach((el) => el.classList.toggle("fallback", usingFallback));
+  const chip = document.querySelector(".event-chip");
+  chip.classList.toggle("fallback", usingFallback);
+  chip.classList.toggle("single", events.length < 2);
+  chip.title = `Checking in to ${currentEvent.code} · ${currentEvent.name}. Every check-in, undo and roster on this page uses this event.`;
+  const banner = document.getElementById("fallback-banner");
+  banner.hidden = !usingFallback;
+  banner.textContent = usingFallback
+    ? `Checking in to ${currentEvent.code} · ${currentEvent.name} (fallback: couldn't load the events you organize)`
+    : "";
   document.title = `${currentEvent.code} · DataHacks Check-In`;
 }
 
@@ -249,8 +299,10 @@ async function switchEvent(nextId) {
   eventId = next.id;
   storeEventId(sessionUserId, next.id);
   roster = [];
+  rosterLoading = true;
   lastScanId = null;
   renderEventPicker();
+  renderActiveRoleView();
   select.disabled = true;
   setStatus("", `<div class="placeholder">Switched to ${escapeHtml(next.code)}. Loading roster…</div>`);
 
@@ -262,6 +314,8 @@ async function switchEvent(nextId) {
       `<div class="placeholder">Now checking in to ${escapeHtml(next.code)} · ${roster.length} on the roster.</div>`
     );
   } catch (err) {
+    rosterLoading = false;
+    renderActiveRoleView();
     setStatus(
       "error",
       `<div class="icon">🚫</div><div><div class="name">Couldn't load ${escapeHtml(next.code)}</div><div class="meta">${escapeHtml(err.message || err)}</div></div>`
@@ -283,7 +337,11 @@ async function loadRoster() {
   // The organizer switched events while this was in flight.
   if (requestedEventId !== eventId) return;
   roster = (data || []).map(normalizeRow);
+  rosterLoading = false;
+  renderActiveRoleView();
+}
 
+function renderActiveRoleView() {
   ROLES.forEach((role) => {
     if (document.getElementById("view-" + role).classList.contains("active")) {
       renderRoleView(role);
@@ -343,7 +401,7 @@ async function processCode(rawText) {
   const code = resolveCode(raw);
   const now = Date.now();
   if (!code) return;
-  if (code === lastScanId && now - lastScanTime < 3000) return;
+  if (code === lastScanId && now - lastScanTime < 3000) return { status: "throttled" };
   lastScanId = code;
   lastScanTime = now;
 
@@ -359,7 +417,7 @@ async function processCode(rawText) {
       "error",
       `<div class="icon">🚫</div><div><div class="name">Check-in failed</div><div class="meta">${escapeHtml(error.message || error)}</div></div>`
     );
-    return;
+    return { status: "error", message: error.message || String(error) };
   }
 
   const status = data?.status;
@@ -376,7 +434,7 @@ async function processCode(rawText) {
       "error",
       `<div class="icon">⚠️</div><div><div class="name">Unrecognized code</div><div class="meta">${escapeHtml(hint)}</div></div>`
     );
-    return;
+    return { status: "unknown", message: hint };
   }
 
   if (status === "dupe") {
@@ -401,6 +459,7 @@ async function processCode(rawText) {
   } catch (err) {
     console.error(err);
   }
+  return data || {};
 }
 
 async function undoCode(code) {
@@ -413,7 +472,7 @@ async function undoCode(code) {
       "error",
       `<div class="icon">🚫</div><div><div class="name">Undo failed</div><div class="meta">${escapeHtml(error.message || error)}</div></div>`
     );
-    return;
+    return { status: "error", message: error.message || String(error) };
   }
   if (data?.status === "ok") {
     setStatus(
@@ -426,64 +485,145 @@ async function undoCode(code) {
   } catch (err) {
     console.error(err);
   }
+  return data || {};
+}
+
+// Not yet first (what the desk still has to do), then checked in; A–Z inside each group.
+function compareByName(a, b) {
+  return a.name.localeCompare(b.name, undefined, { sensitivity: "base" }) || a.code.localeCompare(b.code);
+}
+
+const ICON_CHECK =
+  '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+function personRow(p, role) {
+  const otherRoles = roleList(p).filter((r) => r !== role && ROLE_SINGULAR[r]);
+  // Mentors and judges show their role label (e.g. "Mentor + Judge" for a B code).
+  const roleLabel =
+    role === "hacker" && !otherRoles.length
+      ? ""
+      : [role, ...otherRoles].map((r) => ROLE_SINGULAR[r]).join(" + ");
+  const details = [p.team, roleLabel].filter(Boolean);
+  const status = p.checked_in
+    ? `<span class="status-badge in">${ICON_CHECK}<span>In${p.at ? ` · ${escapeHtml(p.at)}` : ""}</span></span>`
+    : `<span class="status-badge out"><span>Not yet</span></span>`;
+  const action = p.checked_in
+    ? `<button class="row-undo" type="button" data-undo="${escapeHtml(p.code)}" aria-label="Undo check-in for ${escapeHtml(p.name)}">Undo</button>`
+    : `<button class="primary row-checkin" type="button" data-code="${escapeHtml(p.code)}" aria-label="Check in ${escapeHtml(p.name)}">Check in</button>`;
+  return `
+    <li class="person ${p.checked_in ? "is-in" : "is-out"}">
+      <div class="person-main">
+        <div class="person-name">${escapeHtml(p.name)}</div>
+        <div class="person-meta">${status}<span class="person-code">${escapeHtml(p.code)}</span></div>
+        ${details.length ? `<div class="person-details">${details.map((d) => `<span>${escapeHtml(d)}</span>`).join("")}</div>` : ""}
+      </div>
+      <div class="person-action">${action}</div>
+    </li>`;
 }
 
 function renderRoleView(role) {
   const all = roster.filter((r) => roleList(r).includes(role));
   const searchEl = document.getElementById(`${role}-search`);
-  const filterEl = document.getElementById(`${role}-status-filter`);
-  const search = (searchEl?.value || "").toLowerCase();
-  const statusFilter = filterEl?.value || "all";
+  const search = (searchEl?.value || "").trim().toLowerCase();
+  const filter = statusFilter[role];
+  const label = ROLE_LABELS[role].toLowerCase();
 
   const checkedInCount = all.filter((r) => r.checked_in).length;
-  document.getElementById(`${role}-count`).innerHTML =
-    `<b>${checkedInCount}</b> / ${all.length} checked in`;
+  const notYetCount = all.length - checkedInCount;
+  const pct = all.length ? Math.round((checkedInCount / all.length) * 100) : 0;
+  document.getElementById(`${role}-count`).innerHTML = rosterLoading
+    ? `<b>—</b><span class="summary-of"> / —</span>`
+    : `<b>${checkedInCount}</b><span class="summary-of"> / ${all.length}</span>`;
+  const bar = document.getElementById(`${role}-progress`);
+  bar.style.setProperty("--pct", `${rosterLoading ? 0 : pct}%`);
+  bar.setAttribute("aria-valuenow", String(rosterLoading ? 0 : pct));
+  bar.setAttribute("aria-valuetext", `${checkedInCount} of ${all.length} checked in`);
+  const counts = { all: all.length, in: checkedInCount, out: notYetCount };
+  document.querySelectorAll(`#view-${role} .chip`).forEach((chip) => {
+    const active = chip.dataset.filter === filter;
+    chip.classList.toggle("active", active);
+    chip.setAttribute("aria-pressed", String(active));
+    chip.querySelector(".chip-count").textContent = rosterLoading ? "" : counts[chip.dataset.filter];
+  });
+  document.getElementById(`${role}-search-clear`).hidden = !search;
 
-  const filtered = all
-    .filter((p) =>
-      statusFilter === "all" ? true : statusFilter === "in" ? p.checked_in : !p.checked_in
-    )
-    .filter((p) => {
-      const hay = `${p.name} ${p.email || ""} ${p.code}`.toLowerCase();
-      return hay.includes(search);
-    });
+  const list = document.getElementById(`${role}-list`);
+  list.setAttribute("aria-busy", String(rosterLoading));
 
-  const body = document.getElementById(`${role}-body`);
-  body.innerHTML = "";
-
-  if (filtered.length === 0) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="6">No ${ROLE_LABELS[role].toLowerCase()} match this view.</td></tr>`;
+  if (rosterLoading) {
+    list.innerHTML = Array.from({ length: 6 }, () => `<li class="person skeleton" aria-hidden="true"><div></div><div></div></li>`).join("") +
+      `<li class="visually-hidden">Loading ${label}…</li>`;
     return;
   }
 
-  filtered.forEach((p) => {
-    const tr = document.createElement("tr");
-    // Same cells feed the desktop table and the phone cards (see style.css).
-    tr.innerHTML = `
-      <td class="c-status"><span class="pill ${p.checked_in ? "in" : "out"}">${p.checked_in ? "Checked in" : "Not yet"}</span></td>
-      <td class="c-name">${escapeHtml(p.name)}</td>
-      <td class="c-code">${escapeHtml(p.code)}</td>
-      <td class="c-team${p.team ? "" : " is-empty"}">${escapeHtml(p.team || "—")}</td>
-      <td class="c-time${p.at ? "" : " is-empty"}">${p.at ? `<span class="c-time-prefix">at </span>${escapeHtml(p.at)}` : "—"}</td>
-      <td class="c-action">${
-        p.checked_in
-          ? `<button class="ghost row-btn" type="button" data-undo="${escapeHtml(p.code)}">Undo</button>`
-          : `<button class="ghost row-btn" type="button" data-code="${escapeHtml(p.code)}">Check in</button>`
-      }</td>
-    `;
-    body.appendChild(tr);
-  });
+  if (all.length === 0) {
+    list.innerHTML = `<li class="empty-state"><b>No ${label} on the ${escapeHtml(currentEvent?.code || "")} roster yet.</b><span>People appear here once their application is accepted.</span></li>`;
+    return;
+  }
 
-  body.querySelectorAll("button[data-code]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      await processCode(btn.dataset.code);
-    });
-  });
-  body.querySelectorAll("button[data-undo]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      await undoCode(btn.dataset.undo);
-    });
-  });
+  const matches = all.filter((p) => `${p.name} ${p.email || ""} ${p.code} ${p.team || ""}`.toLowerCase().includes(search));
+  const groups = [
+    { key: "out", title: "Not yet", people: matches.filter((p) => !p.checked_in).sort(compareByName) },
+    { key: "in", title: "Checked in", people: matches.filter((p) => p.checked_in).sort(compareByName) },
+  ].filter((g) => (filter === "all" || filter === g.key) && g.people.length);
+
+  if (!groups.length) {
+    const why = search
+      ? `No ${label} match “${escapeHtml(searchEl.value.trim())}”${filter === "all" ? "" : " in this filter"}.`
+      : filter === "in"
+        ? `No ${label} checked in yet.`
+        : `Everyone's checked in.`;
+    list.innerHTML = `<li class="empty-state"><b>${why}</b>${
+      search || filter !== "all" ? `<button class="ghost small" type="button" data-reset>Show all ${label}</button>` : ""
+    }</li>`;
+    return;
+  }
+
+  list.innerHTML = groups
+    .map(
+      (g) =>
+        `<li class="group-head" role="presentation"><span>${g.title}</span><span class="group-count">${g.people.length}</span></li>` +
+        g.people.map((p) => personRow(p, role)).join("")
+    )
+    .join("");
+}
+
+let toastTimer = null;
+function toast(message, kind = "") {
+  const el = document.getElementById("toast");
+  el.textContent = message;
+  el.className = `toast ${kind}`;
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    el.hidden = true;
+  }, 3200);
+}
+
+async function rosterCheckIn(btn) {
+  btn.disabled = true;
+  btn.textContent = "Checking…";
+  const result = await processCode(btn.dataset.code);
+  if (result?.status === "ok") toast(`Checked in ${result.name || result.code}`, "success");
+  else if (result?.status === "dupe") toast(`${result.name || result.code} was already checked in`, "error");
+  else if (result?.status === "throttled") toast("Just checked that code. Give it a second.");
+  else toast(result?.message || "Check-in failed", "error");
+  // A successful check-in re-renders the list; otherwise restore the button.
+  if (btn.isConnected) {
+    btn.disabled = false;
+    btn.textContent = "Check in";
+  }
+}
+
+async function rosterUndo(btn) {
+  const person = roster.find((p) => p.code === btn.dataset.undo);
+  const who = person ? `${person.name} (${person.code})` : btn.dataset.undo;
+  if (!window.confirm(`Undo check-in for ${who}?\n\nThey'll be marked as not checked in.`)) return;
+  btn.disabled = true;
+  const result = await undoCode(btn.dataset.undo);
+  if (result?.status === "ok") toast(`Undid check-in for ${result.name || result.code}`);
+  else toast(result?.message || "Undo failed", "error");
+  if (btn.isConnected) btn.disabled = false;
 }
 
 function exportRole(role) {
@@ -509,33 +649,74 @@ function exportRole(role) {
   URL.revokeObjectURL(url);
 }
 
+const ICON_DOWNLOAD =
+  '<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M10 3v9m0 0-3.5-3.5M10 12l3.5-3.5M4 14.5V16h12v-1.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const ICON_SEARCH =
+  '<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><circle cx="9" cy="9" r="5.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m13.2 13.2 3.3 3.3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
+
 ROLES.forEach((role) => {
   const view = document.getElementById("view-" + role);
+  const label = ROLE_LABELS[role];
   view.innerHTML = `
-    <div class="panel">
-      <div class="panel-head">
-        <h2>${ROLE_LABELS[role]}</h2>
-        <div class="count-line" id="${role}-count">— / —</div>
+    <div class="roster-panel">
+      <div class="roster-top">
+        <div class="summary">
+          <div class="summary-text">
+            <div class="summary-count" id="${role}-count"><b>—</b><span class="summary-of"> / —</span></div>
+            <div class="summary-label">checked in</div>
+          </div>
+          <button class="icon-btn" id="${role}-export-btn" type="button" aria-label="Export ${label.toLowerCase()} as CSV" title="Export CSV">${ICON_DOWNLOAD}<span>CSV</span></button>
+        </div>
+        <div class="progress" id="${role}-progress" role="progressbar" aria-label="${label} checked in" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+        <div class="chips" role="group" aria-label="Filter ${label.toLowerCase()} by status">
+          ${STATUS_FILTERS.map(
+            ([key, text]) =>
+              `<button class="chip${key === "all" ? " active" : ""}" type="button" data-filter="${key}" aria-pressed="${key === "all"}">${text}<span class="chip-count"></span></button>`
+          ).join("")}
+        </div>
+        <div class="search">
+          ${ICON_SEARCH}
+          <input id="${role}-search" type="search" placeholder="Search name, code, team" aria-label="Search ${label.toLowerCase()}"
+                 autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search">
+          <button class="search-clear" id="${role}-search-clear" type="button" aria-label="Clear search" hidden>
+            <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          </button>
+        </div>
       </div>
-      <div class="toolbar">
-        <input id="${role}-search" type="search" placeholder="Search name, code, email" aria-label="Search ${ROLE_LABELS[role].toLowerCase()}"
-               autocapitalize="off" autocorrect="off" spellcheck="false">
-        <select id="${role}-status-filter" aria-label="Filter by status">
-          <option value="all">All</option>
-          <option value="in">Checked in</option>
-          <option value="out">Not checked in</option>
-        </select>
-        <button class="ghost" id="${role}-export-btn" type="button">Export CSV</button>
-      </div>
-      <table class="roster">
-        <thead><tr><th>Status</th><th>Name</th><th>Code</th><th>Team</th><th>Checked in at</th><th></th></tr></thead>
-        <tbody id="${role}-body"></tbody>
-      </table>
+      <ul class="person-list" id="${role}-list" aria-label="${label}"></ul>
     </div>
   `;
-  document.getElementById(`${role}-search`).addEventListener("input", () => renderRoleView(role));
-  document.getElementById(`${role}-status-filter`).addEventListener("change", () => renderRoleView(role));
+  const search = document.getElementById(`${role}-search`);
+  search.addEventListener("input", () => renderRoleView(role));
+  // Enter on the phone keyboard closes it so the whole list is visible.
+  search.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") search.blur();
+  });
+  document.getElementById(`${role}-search-clear`).addEventListener("click", () => {
+    search.value = "";
+    renderRoleView(role);
+    search.focus();
+  });
+  view.querySelectorAll(".chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      statusFilter[role] = chip.dataset.filter;
+      renderRoleView(role);
+      document.getElementById(`${role}-list`).scrollTop = 0;
+    });
+  });
   document.getElementById(`${role}-export-btn`).addEventListener("click", () => exportRole(role));
+  document.getElementById(`${role}-list`).addEventListener("click", (e) => {
+    const checkIn = e.target.closest("button[data-code]");
+    const undo = e.target.closest("button[data-undo]");
+    const reset = e.target.closest("button[data-reset]");
+    if (checkIn) rosterCheckIn(checkIn);
+    else if (undo) rosterUndo(undo);
+    else if (reset) {
+      search.value = "";
+      statusFilter[role] = "all";
+      renderRoleView(role);
+    }
+  });
 });
 
 document.querySelectorAll(".tab-btn").forEach((btn) => {
@@ -589,6 +770,18 @@ function setScannerState(state, detail) {
     stopBtn.disabled = true;
   }
 }
+
+// The preview is a square crop of the camera (decoding still reads the whole
+// frame). Pass the stream's aspect ratio to CSS so the video always covers the
+// square, portrait (iOS) or landscape, even where object-fit is ignored.
+function syncVideoAspect() {
+  const video = document.getElementById("scanner-video");
+  if (!video.videoWidth || !video.videoHeight) return;
+  document.getElementById("reader-frame").style.setProperty("--video-ar", String(video.videoWidth / video.videoHeight));
+}
+["loadedmetadata", "resize", "playing"].forEach((type) => {
+  document.getElementById("scanner-video").addEventListener(type, syncVideoAspect);
+});
 
 function getScanner() {
   if (!scanner) {
@@ -718,7 +911,7 @@ async function startSession(session) {
       await rejectNonOrganizer(session);
       return;
     }
-    document.getElementById("session-email").textContent = session.user.email || "";
+    setSessionEmail(session.user.email || "");
     showBoot("Loading roster…");
     await loadRoster();
     await subscribeAttendees();
@@ -749,7 +942,7 @@ supabase.auth.onAuthStateChange((_event, session) => {
     events = [];
     roster = [];
     sessionUserId = null;
-    document.getElementById("session-email").textContent = "";
+    setSessionEmail("");
     resetGoogleButton();
     showAuth();
     return;

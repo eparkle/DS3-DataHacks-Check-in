@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#0A1628">
 <title>DataHacks Check-In</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -37,22 +37,22 @@
   <div id="boot-message">Connecting to database…</div>
 </div>
 
-<div class="wrap app-hidden" id="app">
+<div class="shell app-hidden" id="app">
 
-  <header class="app-header">
+  <header class="app-bar">
     <div class="brand">
-      <h1>DataHacks Check-In</h1>
-      <label class="event-picker" for="event-select" title="Every check-in, undo and roster on this page uses this event">
-        <span class="event-picker-label">Checking in to</span>
-        <select id="event-select" disabled>
-          <option>—</option>
-        </select>
-      </label>
+      <span class="brand-kicker">DataHacks</span>
+      <h1>Check-In</h1>
     </div>
-    <div class="account">
-      <span id="session-email"></span>
-      <button class="ghost small" id="sign-out-btn" type="button">Sign out</button>
+    <div class="event-chip" title="Every check-in, undo and roster on this page uses this event">
+      <span class="event-chip-code current-event-code" aria-hidden="true">—</span>
+      <svg class="event-chip-caret" viewBox="0 0 12 12" width="10" height="10" aria-hidden="true"><path d="M2.5 4.5 6 8l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <select id="event-select" aria-label="Event" disabled>
+        <option>—</option>
+      </select>
     </div>
+    <span class="session-email" id="session-email"></span>
+    <button class="ghost small" id="sign-out-btn" type="button" aria-label="Sign out">Sign out</button>
   </header>
 
   <nav class="tabs" aria-label="Sections">
@@ -62,11 +62,10 @@
     <button class="tab-btn" data-view="mentor" type="button">Mentors</button>
   </nav>
 
-  <div class="view active" id="view-scan">
-    <div class="scan-grid">
-      <div class="panel">
-        <div class="event-banner">Checking in to <b class="current-event-code">—</b> <span class="current-event-name"></span></div>
-        <h2>Camera scanner</h2>
+  <main class="views">
+    <section class="view active" id="view-scan" aria-label="Scan">
+      <div class="scan-panel">
+        <div class="event-banner fallback" id="fallback-banner" hidden></div>
         <div id="reader-frame" data-state="idle">
           <video id="scanner-video" playsinline muted autoplay disablepictureinpicture aria-label="Camera preview"></video>
           <!-- Decorative only: the whole camera frame is scanned. -->
@@ -81,7 +80,7 @@
           <button class="primary" id="start-btn" type="button">Start camera</button>
           <button class="ghost" id="stop-btn" type="button" disabled>Stop</button>
         </div>
-        <div id="status-card">
+        <div id="status-card" aria-live="polite">
           <div class="placeholder">Waiting for first scan…</div>
         </div>
         <form class="manual" id="manual-form" autocomplete="off">
@@ -92,13 +91,14 @@
         </form>
         <p class="note">QR codes encode the attendee code (DH26-H001, DH26-J001, DH26-M001, DH26-B001). Email also works if they’re on the roster.</p>
       </div>
-    </div>
-  </div>
+    </section>
 
-  <div class="view" id="view-hacker" data-role="hacker"></div>
-  <div class="view" id="view-judge" data-role="judge"></div>
-  <div class="view" id="view-mentor" data-role="mentor"></div>
+    <section class="view" id="view-hacker" data-role="hacker" aria-label="Hackers"></section>
+    <section class="view" id="view-judge" data-role="judge" aria-label="Judges"></section>
+    <section class="view" id="view-mentor" data-role="mentor" aria-label="Mentors"></section>
+  </main>
 
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 </div>
 
 <script type="module" src="/src/main.js"></script>
