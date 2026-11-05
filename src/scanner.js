@@ -188,35 +188,6 @@ function replaceDecoder(current) {
   return decoderPromise;
 }
 
-// ---------- Haptics ----------
-
-let hapticLabel = null;
-export function haptic() {
-  try {
-    if (typeof navigator.vibrate === "function" && navigator.vibrate(60)) return;
-  } catch {
-    /* fall through */
-  }
-  // iOS Safari has no Vibration API, but iOS 18+ plays a haptic tick when a
-  // <input type="checkbox" switch> is toggled through its label.
-  try {
-    if (!hapticLabel) {
-      hapticLabel = document.createElement("label");
-      hapticLabel.setAttribute("aria-hidden", "true");
-      hapticLabel.style.cssText = "position:fixed;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none;left:-9999px;top:0;";
-      const input = document.createElement("input");
-      input.type = "checkbox";
-      input.setAttribute("switch", "");
-      input.tabIndex = -1;
-      hapticLabel.appendChild(input);
-      document.body.appendChild(hapticLabel);
-    }
-    hapticLabel.click();
-  } catch {
-    /* no haptics on this device */
-  }
-}
-
 // ---------- Scanner ----------
 
 export class QrScanner {
@@ -314,6 +285,27 @@ export class QrScanner {
     this.rafId = requestAnimationFrame(this.tick);
   }
 
+  // Flashlight: only offered when the camera track reports a torch.
+  get torchSupported() {
+    const track = this.stream?.getVideoTracks()[0];
+    try {
+      return !!track?.getCapabilities?.().torch;
+    } catch {
+      return false;
+    }
+  }
+
+  async setTorch(on) {
+    const track = this.stream?.getVideoTracks()[0];
+    if (!track) return false;
+    try {
+      await track.applyConstraints({ advanced: [{ torch: !!on }] });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   stop() {
     this.session++;
     this.starting = false;
@@ -373,7 +365,7 @@ export class QrScanner {
     if (repeat) return; // still the same code in front of the camera
     if (!performance.getEntriesByName("scanner:first-decode").length) performance.mark("scanner:first-decode");
     this.pausedUntil = now + PAUSE_AFTER_HIT_MS;
-    haptic();
+    // Sound, flash and vibration follow the check-in result (see feedback.js).
     this.onDecode(text);
   }
 }
