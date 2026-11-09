@@ -11,6 +11,7 @@ npm install
 cp .env.example .env
 # fill VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY
 npm run dev
+npm test        # unit tests (vitest): CSV escaping, error sorting, paging, the offline queue
 ```
 
 Open http://localhost:5173 and sign in with an **organizer** account (`event_roles.role = 'organizer'`).

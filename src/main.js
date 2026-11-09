@@ -19,6 +19,9 @@ import {
   clearUserCache,
 } from "./offline.js";
 import { requestPersistence } from "./offline-store.js";
+import { isRetryable, describeFailure } from "./errors.js";
+import { fetchAllPages } from "./paging.js";
+import { toCsv } from "./csv.js";
 import { mountSyncUI, ICON_SAVED } from "./sync-ui.js";
 import {
   CHECK_IN,
@@ -351,7 +354,8 @@ function persistRosterSoon(delay = 800) {
 
 function queryError(res) {
   const err = new Error(res.message || "Request failed");
-  err.transient = res.kind === "transient";
+  // No answer, a server error or a lost sign-in: the copy saved on this phone may stand in.
+  err.transient = isRetryable(res);
   return err;
 }
 
@@ -547,10 +551,15 @@ let optionalColumns = OPTIONAL_COLUMNS.map((g) => g.slice());
 const isMissingColumn = (error) => error?.code === "42703" || error?.code === "PGRST204";
 
 // Resolves to timedQuery's { kind: "ok" | "transient" | "error", ... }.
+// Read 1,000 rows at a time (PostgREST's cap), ordered by (code, id): code is
+// unique per event, id breaks any tie, so pages never overlap or skip.
 async function fetchRoster(id) {
   for (;;) {
     const columns = [ROSTER_COLUMNS, ...optionalColumns.flat()].join(", ");
-    const res = await timedQuery(() => supabase.from("attendees").select(columns).eq("event_id", id).order("code"));
+    const res = await fetchAllPages(
+      (from, to) => timedQuery(() => supabase.from("attendees").select(columns).eq("event_id", id).order("code").order("id").range(from, to)),
+      { key: (row) => row?.id }
+    );
     if (res.kind !== "error" || !isMissingColumn(res) || !optionalColumns.length) return res;
     const i = optionalColumns.findIndex((g) => g.some((c) => (res.message || "").includes(c)));
     optionalColumns.splice(i >= 0 ? i : 0, 1);
@@ -575,7 +584,7 @@ async function loadRoster() {
     // A refresh that failed keeps the roster on screen.
     if (!rosterLoading) throw queryError(res);
     // First load with no connection: the roster saved on this phone.
-    const cached = res.kind === "transient" ? await loadRosterCache(userId, requestedEventId) : null;
+    const cached = isRetryable(res) ? await loadRosterCache(userId, requestedEventId) : null;
     if (requestedEventId !== eventId) return;
     if (!cached) throw queryError(res);
     rosterSyncedAt = cached.syncedAt;
@@ -771,6 +780,9 @@ const BAND = {
   "scan-nci": { icon: "!", label: "Not checked in yet", card: "warning" },
   // Not on the roster, with the reason (lookup_not_on_roster).
   lookup: { icon: "!" },
+  // Saved on this phone, then the server wouldn't take it for a reason that
+  // isn't about the person (sign-in gone, server errors): not checked in.
+  "not-synced": { icon: "✕", label: "Not checked in", card: "error" },
 };
 
 const UNKNOWN_KINDS = new Set(["error", "unverified", "saved-unverified", "lookup"]);
@@ -779,6 +791,7 @@ function bandLabel(scan) {
   if (scan.kind === "scan-ok") return scan.mode.label;
   if (scan.kind === "scan-already") return `Already had ${scan.mode.label}`;
   if (scan.kind === "lookup") return scan.lookup.band;
+  if (scan.kind === "not-synced" && scan.mode) return `${scan.mode.label} not recorded`;
   return BAND[scan.kind].label;
 }
 
@@ -845,8 +858,9 @@ function showScan(scan, { quiet = false } = {}) {
     const label = scan.lookup.reason === "no_show" ? "Let in" : "Accept walk-in";
     action = `<button class="undo-btn walkin-btn" type="button" data-walkin="${escapeHtml(scan.applicationId)}" aria-label="${label}: ${escapeHtml(scan.name)}">${label}</button>`;
   }
+  const notSynced = scan.kind === "not-synced";
   let metaParts;
-  if (unknown) metaParts = [scan.hint];
+  if (unknown || notSynced) metaParts = [scan.hint];
   else if (scan.kind === "scan-already") metaParts = [scan.byText, scan.roleText];
   else if (scan.kind === "scan-nci") metaParts = ["recorded"];
   else metaParts = [scan.roleText, scan.team, scan.kind === "warning" ? (scan.otherDesk ? "checked in at another desk" : "no action taken") : ""];
@@ -854,7 +868,7 @@ function showScan(scan, { quiet = false } = {}) {
   // Waiver on file or not (check-ins only; nothing when the database can't
   // say). It sits at the end of the meta line and never truncates; the code
   // goes short to make room. Offline, it comes from the roster saved on this phone.
-  const waiver = unknown || isScanMode ? "" : waiverBadge(scan.waiver, { code: scan.code, name: scan.name, button: true });
+  const waiver = unknown || notSynced || isScanMode ? "" : waiverBadge(scan.waiver, { code: scan.code, name: scan.name, button: true });
   const code = waiver || scan.kind === "lookup" ? shortCode(scan.code) : scan.code;
   // Who to check ID for: a fresh check-in only.
   const id = !isScanMode && scan.kind === "success" ? idLine(scan.idc) : "";
@@ -899,11 +913,12 @@ function recentStatus(scan, kind) {
   if (kind === "undone") return `<span class="t">undone</span>`;
   if (scan.mode) {
     const label = scan.mode.label;
-    const what = scan.kind === "scan-ok" ? `${label},` : scan.kind === "scan-already" ? `Already had ${label} at` : scan.kind === "scan-nci" ? `${label} recorded, not checked in,` : scan.kind === "error" ? `${label}: not on roster,` : `${label}: not verified,`;
+    const what = scan.kind === "not-synced" ? `${label}: not recorded,` : scan.kind === "scan-ok" ? `${label},` : scan.kind === "scan-already" ? `Already had ${label} at` : scan.kind === "scan-nci" ? `${label} recorded, not checked in,` : scan.kind === "error" ? `${label}: not on roster,` : `${label}: not verified,`;
     const icon = scan.pending ? ICON_SAVED : mark(BAND[scan.kind]?.icon || "?");
     return `<span class="mt" aria-hidden="true">${escapeHtml(label)}</span>${t(icon, what, scan.kind === "scan-already" ? scan.inShort : scan.timeShort)}`;
   }
   if (scan.kind === "lookup") return t(mark("!"), `${scan.lookup.band},`, scan.timeShort);
+  if (scan.kind === "not-synced") return t(mark("✕"), "Not checked in, didn't sync,", scan.timeShort);
   if (kind === "error") return t(mark("✕"), "Unknown code,", scan.timeShort);
   if (UNKNOWN_KINDS.has(scan.kind))
     return t(scan.kind === "saved-unverified" ? ICON_SAVED : mark("?"), scan.kind === "saved-unverified" ? "Saved on this phone, not verified," : "Couldn't verify offline,", scan.timeShort);
@@ -922,10 +937,12 @@ function renderRecent() {
       const unknown = UNKNOWN_KINDS.has(scan.kind);
       const undone =
         !scan.mode &&
-        ((scan.kind === "saved-unverified" && !savedOp(scan.code)) || (!unknown && person && !person.checked_in));
+        ((scan.kind === "saved-unverified" && !savedOp(scan.code)) || (!unknown && scan.kind !== "not-synced" && person && !person.checked_in));
       const kind = undone
         ? "undone"
-        : scan.kind === "scan-ok"
+        : scan.kind === "not-synced"
+          ? "error"
+          : scan.kind === "scan-ok"
           ? "scan"
           : scan.kind === "scan-already" || scan.kind === "scan-nci"
             ? "warning"
@@ -1111,10 +1128,14 @@ async function processScan(raw, code, type) {
   });
   if (result.kind === "transient") return scanOffline(raw, code, mode, clientId);
   if (result.kind === "error") {
-    const message = isMissingApi(result) ? "This database can't record meal or swag scans yet." : result.message;
-    setFailure(`${mode.label} not recorded`, message);
+    // A real answer from the server (sign-in gone, server error, refusal):
+    // never saved on the phone, never green.
+    const failure = isMissingApi(result)
+      ? { title: `${mode.label} not recorded`, detail: "This database can't record meal or swag scans yet." }
+      : describeFailure(result, { action: `${mode.label} not recorded`, title: `${mode.label} not recorded` });
+    setFailure(failure.title, failure.detail);
     announce("error");
-    return { status: "error", message };
+    return { status: "error", message: failure.detail };
   }
   const data = result.data || {};
   const base = baseFromData(data, code);
@@ -1178,7 +1199,7 @@ async function canMarkWaiver() {
   if (!id || isOffline()) return false;
   if (waiverMarkSupport.has(id)) return waiverMarkSupport.get(id);
   const res = await callRpc("mark_waiver_seen", { p_event_id: id, p_person_id: null, p_note: null });
-  if (res.kind === "transient") return false; // ask again next time
+  if (isRetryable(res)) return false; // ask again next time
   const ok = res.kind === "error" && res.code === "22004";
   waiverMarkSupport.set(id, ok);
   return ok;
@@ -1204,7 +1225,7 @@ async function markWaiverSigned(person) {
     waiverMarkSupport.set(eventId, false);
     return { ok: false, message: "This database can't mark waivers yet." };
   }
-  if (res.kind === "error") return { ok: false, message: res.message };
+  if (res.kind === "error") return { ok: false, message: describeFailure(res, { action: "Not marked" }).detail };
   const status = res.data?.status;
   if (status !== "marked" && status !== "already_on_file") return { ok: false, message: MARK_REFUSED[status] || "Couldn't mark it." };
   reloadRoster();
@@ -1236,7 +1257,8 @@ async function acceptWalkIn(btn) {
     return;
   }
   if (res.kind === "error") {
-    setFailure("Walk-in failed", res.message);
+    const failure = describeFailure(res, { action: "Walk-in not accepted", title: "Walk-in failed" });
+    setFailure(failure.title, failure.detail);
     announce("error");
     return;
   }
@@ -1315,9 +1337,12 @@ async function processCode(rawText, { mode = currentMode() } = {}) {
         return { status: "error", message: result.message };
       });
     }
-    setFailure("Check-in failed", result.message);
+    // Signed out, a server error (5xx) or a refusal: a real answer, so it
+    // isn't saved on the phone and the card is red, not "will sync".
+    const failure = describeFailure(result, { action: "Not checked in", title: "Check-in failed" });
+    setFailure(failure.title, failure.detail);
     announce("error");
-    return { status: "error", message: result.message };
+    return { status: "error", message: failure.detail };
   }
 
   const data = result.data;
@@ -1402,8 +1427,9 @@ async function undoCode(code) {
       reloadRoster();
       return { status: "error", message };
     }
-    setFailure("Undo failed", result.message);
-    return { status: "error", message: result.message };
+    const failure = describeFailure(result, { action: "Not undone", title: "Undo failed" });
+    setFailure(failure.title, failure.detail);
+    return { status: "error", message: failure.detail };
   }
   const data = result.data;
   if (data?.status === "ok") {
@@ -1700,7 +1726,8 @@ function exportRole(role) {
       ...(withWaiver ? [p.waiver === "signed" ? "yes" : p.waiver === "missing" ? "no" : ""] : []),
     ])
   );
-  const csv = out.map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
+  // Quoted, and formula-like text (= + - @ …) neutralised: see csv.js.
+  const csv = toCsv(out);
   const blob = new Blob([csv], { type: "text/csv" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -2206,11 +2233,18 @@ queue.onSettled = (item, outcome, data) => {
     } else if (outcome === "attention") {
       const p = rosterByCode.get(item.code);
       if (p && p.checked_in_at === item.at) patchPerson(item.code, null);
-      scans.forEach((s) => Object.assign(s, { kind: "error", pending: false, role: "none", hint: item.error && item.error !== "Not on the roster" ? item.error : "server says not on the roster" }));
+      // Sign-in gone / server errors: not about the person, so not "Unknown code".
+      const kind = item.blocked ? "not-synced" : "error";
+      scans.forEach((s) => Object.assign(s, { kind, pending: false, role: "none", hint: item.error && item.error !== "Not on the roster" ? item.error : "server says not on the roster" }));
     }
   } else if (outcome === "undone") {
     const p = rosterByCode.get(item.code);
     if (p && !savedOp(item.code)) patchPerson(item.code, null);
+  } else if (item.op === "undo" && outcome === "attention") {
+    // The undo didn't reach the server: as far as it knows they're still in.
+    const p = rosterByCode.get(item.code);
+    if (p && !p.checked_in && item.prevAt && !savedOp(item.code)) patchPerson(item.code, item.prevAt);
+    scheduleReload();
   }
   if (currentScan && scans.includes(currentScan)) showScan(currentScan, { quiet: true });
   renderRecent();
@@ -2237,7 +2271,7 @@ function settleScan(item, outcome, data, scans) {
       recentScans = [{ ...scanBase(item.code, p || { name: data?.name || item.name, roles: data?.roles }), ...already }, ...recentScans].slice(0, RECENT_MAX);
     }
   } else if (outcome === "attention") {
-    scans.forEach((s) => Object.assign(s, { kind: "error", pending: false, role: "none", hint: item.error || "server says not on the roster", bandRight: mode.label }));
+    scans.forEach((s) => Object.assign(s, { kind: item.blocked ? "not-synced" : "error", pending: false, role: "none", hint: item.error || "server says not on the roster", bandRight: mode.label }));
   }
 }
 
@@ -2345,7 +2379,11 @@ supabase.auth.onAuthStateChange((event, session) => {
     return;
   }
   // Token refreshes and tab refocus re-emit the session; keep the selected event.
-  if (session.user.id === sessionUserId) return;
+  if (session.user.id === sessionUserId) {
+    // A fresh token: what was flagged because the sign-in had gone can sync now.
+    if (event === "TOKEN_REFRESHED" || event === "SIGNED_IN") queue.reopenBlocked("auth");
+    return;
+  }
   sessionUserId = session.user.id;
   startSession(session);
 });

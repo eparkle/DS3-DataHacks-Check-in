@@ -11,6 +11,7 @@
 
 import { supabase } from "./supabase.js";
 import { timedQuery, isMissingApi, saveUserCache, loadUserCache } from "./offline.js";
+import { fetchAllPages } from "./paging.js";
 
 export const CHECK_IN = "check_in";
 const MODE_KEY = "datahacks-checkin:mode:";
@@ -128,8 +129,21 @@ function persistScans(typeId) {
 export async function loadScanLog(typeId) {
   const { userId, eventId } = state;
   if (!userId || !eventId || !typeId) return;
-  const res = await timedQuery(() =>
-    supabase.from("checkin_events").select("code, scanned_at, by_user").eq("event_id", eventId).eq("kind", "scan").eq("scan_type_id", typeId).range(0, 9999)
+  // A big event has more than 1,000 lunches: read them 1,000 at a time
+  // (PostgREST's cap), ordered by the log's id so pages don't overlap.
+  const res = await fetchAllPages(
+    (from, to) =>
+      timedQuery(() =>
+        supabase
+          .from("checkin_events")
+          .select("id, code, scanned_at, by_user")
+          .eq("event_id", eventId)
+          .eq("kind", "scan")
+          .eq("scan_type_id", typeId)
+          .order("id")
+          .range(from, to)
+      ),
+    { key: (row) => row?.id }
   );
   if (eventId !== state.eventId) return;
   const m = scanMap(typeId);

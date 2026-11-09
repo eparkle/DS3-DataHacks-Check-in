@@ -5,7 +5,9 @@
 //   Syncing 3…        sending the queue
 //   3 waiting         amber: online, but the server isn't answering yet
 //   1 needs attention red: the server wouldn't take a saved item (not on
-//                     roster, checked in again since an undo, a no-show)
+//                     roster, checked in again since an undo, a no-show), the
+//                     sign-in is gone (401/403), or server errors (5xx) kept
+//                     coming back. Never "N waiting" forever.
 //   Synced ✓          green for a moment after the queue empties, then hidden
 
 import { queue, isOffline } from "./offline.js";
@@ -89,6 +91,8 @@ export function mountSyncUI({ onSyncNow, onRetry, onDismiss, getRosterSavedAt, s
     if (queue.flushing) text = "Sending to the server…";
     else if (isOffline()) text = pending.length ? "No connection. These are saved on this phone and sync on their own when it's back." : "No connection. Check-ins are saved on this phone and sync when it's back.";
     else if (pending.length) text = `The server isn't answering yet${queue.lastError ? ` (${queue.lastError})` : ""}. Trying again on its own.`;
+    else if (attention.some((i) => i.blocked === "auth")) text = "Your sign-in expired, so these didn't sync and these people are NOT checked in. Sign in again (they retry on their own), or tap Retry.";
+    else if (attention.some((i) => i.blocked === "server")) text = "The server kept failing on these, so they're NOT checked in. Tap Retry, or use the paper list.";
     else if (attention.length) text = "Synced. The server didn't take these: check each one, then dismiss.";
     else text = "Everything on this phone is synced.";
     status.textContent = text + savedText;
