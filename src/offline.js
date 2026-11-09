@@ -3,9 +3,14 @@
 // couldn't reach the server.
 //
 // Rules the rest of the app relies on:
-//   - Only "couldn't reach the server" (offline, fetch TypeError, 5xx, ~6 s
-//     timeout, expired session) is treated as transient. A real answer from
-//     check_in_by_code ("unknown", "dupe") is never queued.
+//   - Only "couldn't reach the server" (offline, fetch threw, ~6 s timeout:
+//     no HTTP answer at all) is treated as transient and may be queued. Any
+//     HTTP answer is real: a 401/403 (sign-in gone), a 5xx (server error) or
+//     a refusal ("unknown", "dupe", a 4xx) is never queued as "will sync";
+//     the desk shows a red card instead (see errors.js).
+//   - A saved item that gets a server error is retried a few times, then
+//     flagged for attention; one that gets a 401/403 is flagged at once (with
+//     everything else waiting), and tried again after the next sign-in.
 //   - The queue holds at most one waiting op per code (a check-in, or an undo
 //     of a server check-in); an undo of a queued check-in just removes it.
 //   - Items are sent one at a time, in order, each with its own client id
@@ -19,6 +24,9 @@
 
 import { supabase } from "./supabase.js";
 import { kvGet, kvSet, kvDelete, kvDeletePrefix } from "./offline-store.js";
+import { classifyResponse, classifySession, isMissingApi, queueStep, attentionText } from "./errors.js";
+
+export { isMissingApi, attentionText };
 
 export const RPC_TIMEOUT_MS = 6000;
 const FLUSH_BASE_MS = 15000;
@@ -72,36 +80,26 @@ function timeoutAfter(ms) {
   return { promise, cancel: () => clearTimeout(timer) };
 }
 
-const JWT_CODES = new Set(["PGRST301", "PGRST302", "PGRST303"]);
-
-// { kind: "ok", data } | { kind: "transient", reason, maybeSent, message } | { kind: "error", message }
-function classify(res, { sent }) {
-  if (res.timedOut) {
-    markReachable(false);
-    return { kind: "transient", reason: "timeout", maybeSent: sent, message: "Timed out" };
-  }
-  const { data, error, status } = res;
-  if (!error) {
-    markReachable(true);
-    return { kind: "ok", data };
-  }
-  const message = error.message || String(error);
-  if (!status) {
-    // fetch TypeError / aborted: never got an HTTP answer.
-    markReachable(false);
-    return { kind: "transient", reason: "network", maybeSent: sent, message };
-  }
-  markReachable(true);
-  if (status >= 500 || status === 408) return { kind: "transient", reason: "server", maybeSent: true, message };
-  if (status === 429) return { kind: "transient", reason: "server", maybeSent: false, message };
-  if (status === 401 || JWT_CODES.has(error.code)) return { kind: "transient", reason: "auth", maybeSent: false, message };
-  return { kind: "error", message, status, code: error.code || "", hint: error.hint || "", detail: error.details || error.detail || "" };
+// The sign-in is gone (401 / 403 / expired JWT): ask supabase-js to refresh
+// once; if the refresh token is gone too it signs out and the app shows the
+// sign-in screen. Throttled so a burst of scans doesn't hammer auth.
+let lastRefreshAt = 0;
+function refreshSessionSoon() {
+  const now = Date.now();
+  if (now - lastRefreshAt < 15000) return;
+  lastRefreshAt = now;
+  supabase.auth.refreshSession().catch(() => {});
 }
 
-// PostgREST couldn't find a function with these parameters (or the table):
-// the database is older than this app.
-export function isMissingApi(res) {
-  return res?.kind === "error" && (res.code === "PGRST202" || res.code === "PGRST205" || res.code === "42P01" || res.code === "42883" || res.status === 404);
+// { kind: "ok", data } | { kind: "transient", reason, maybeSent, message } |
+// { kind: "error", category: "auth" | "server" | "rejected", status, code, message, ... }
+function classify(res, { sent }) {
+  const result = classifyResponse(res, { sent });
+  // No HTTP answer: the network is down (or Supabase is unreachable).
+  // Any HTTP answer, even an error, means it's reachable.
+  markReachable(result.kind !== "transient");
+  if (result.kind === "error" && result.category === "auth") refreshSessionSoon();
+  return result;
 }
 
 // Functions the database only has in their old form (per session).
@@ -149,18 +147,17 @@ export async function callRpc(name, args, { timeout = RPC_TIMEOUT_MS } = {}) {
   }
   const started = Date.now();
   const t = timeoutAfter(timeout);
-  let session = null;
+  let sessionResult;
   try {
-    const res = await Promise.race([supabase.auth.getSession().catch(() => ({ data: {} })), t.promise]);
-    if (res.timedOut) {
-      markReachable(false);
-      return { kind: "transient", reason: "timeout", maybeSent: false, message: "Timed out" };
-    }
-    session = res.data?.session || null;
+    const res = await Promise.race([supabase.auth.getSession().catch((thrown) => ({ thrown })), t.promise]);
+    sessionResult = classifySession(res);
   } finally {
     t.cancel();
   }
-  if (!session) return { kind: "transient", reason: "auth", maybeSent: false, message: "Signed-in session needs the network to refresh" };
+  // No session: offline with an expired token is transient (it refreshes
+  // once the connection is back); signed out / refresh refused is not.
+  if (sessionResult.kind === "transient" && sessionResult.reason !== "lock") markReachable(false);
+  if (sessionResult.kind !== "ok") return sessionResult;
   return timedQuery(() => supabase.rpc(name, args), { timeout: Math.max(1500, timeout - (Date.now() - started)) });
 }
 
@@ -259,6 +256,8 @@ function uuid() {
 //         "undo" | "scan", eventId, code, name, roles, team,
 //         at (client scan time), state: "pending" | "attention", attempts,
 //         unverified, error,
+//         serverFailures: server errors (5xx) so far; flagged at SERVER_RETRY_LIMIT,
+//         blocked: why it's flagged when it wasn't a refusal: "auth" | "server",
 //         prevAt: (undo) the check-in time being undone,
 //         scanTypeId, label: (scan) which meal / swag,
 //         sendingAt: set while a request is out (survives a reload mid-send) }
@@ -282,6 +281,7 @@ export class CheckinQueue {
     this.items = [];
     this.inFlight = null; // id of the item being sent
     this.flushing = false;
+    this.flushAgain = false;
     this.failures = 0;
     this.timer = null;
     this.nextAttemptAt = 0;
@@ -324,6 +324,8 @@ export class CheckinQueue {
         delete i.sendingAt;
         delete i.landedFrom;
         delete i.landedTo;
+        // Flagged because the sign-in had gone: this is a new sign-in, try again.
+        if (i.state === "attention" && i.blocked === "auth") reopen(i);
       });
     } catch {
       this.items = [];
@@ -382,7 +384,9 @@ export class CheckinQueue {
 
   // A meal / swag scan of this code for this scan type saved on this phone.
   scanFor(eventId, code, scanTypeId) {
-    return this.items.find((i) => i.op === "scan" && i.eventId === eventId && i.code === code && i.scanTypeId === scanTypeId) || null;
+    // One flagged because it never reached the server (sign-in gone, server
+    // errors) doesn't count: they haven't had it as far as anyone knows.
+    return this.items.find((i) => i.op === "scan" && i.eventId === eventId && i.code === code && i.scanTypeId === scanTypeId && !(i.state === "attention" && i.blocked)) || null;
   }
 
   async add(fields) {
@@ -414,12 +418,26 @@ export class CheckinQueue {
   async retry(id) {
     const item = this.items.find((i) => i.id === id);
     if (!item) return;
-    item.state = "pending";
-    item.error = "";
+    reopen(item);
     // Move it to the end so it doesn't block newer check-ins.
     this.items = [...this.items.filter((i) => i.id !== id), item];
     this.emit();
     await this.persist();
+    this.flushSoon();
+  }
+
+  // The session came back (token refreshed / signed in again in this tab):
+  // items flagged because the sign-in was gone get one more go each. Once
+  // only, so a 403 that isn't about the token can't loop with the refresh.
+  reopenBlocked(kind = "auth") {
+    const items = this.items.filter((i) => i.state === "attention" && i.blocked === kind && !i.autoReopened);
+    if (!items.length) return;
+    items.forEach((i) => {
+      reopen(i);
+      i.autoReopened = true;
+    });
+    this.emit();
+    this.persist();
     this.flushSoon();
   }
 
@@ -458,7 +476,12 @@ export class CheckinQueue {
   }
 
   async flush() {
-    if (this.flushing || !this.userId) return;
+    if (this.flushing) {
+      // Asked again mid-flush (back online, a sign-in came back): one more pass after this one.
+      this.flushAgain = true;
+      return;
+    }
+    if (!this.userId) return;
     if (!this.pending.length) return;
     if (typeof navigator !== "undefined" && navigator.onLine === false) {
       this.backoff();
@@ -485,19 +508,45 @@ export class CheckinQueue {
         delete item.sendingAt;
         if (this.userId !== userId) return;
 
-        if (result.kind === "transient") {
-          this.lastError = result.message;
+        const step = queueStep(result, item);
+        item.serverFailures = step.serverFailures;
+        if (step.action === "wait") {
+          // No answer (or a server error, under the limit): try again later.
+          this.lastError = result.kind === "error" ? `server error, HTTP ${result.status}` : result.message;
           await this.persist();
           stoppedEarly = true;
-          if (result.reason === "auth") supabase.auth.refreshSession().catch(() => {});
           this.backoff();
+          break;
+        }
+        if (step.action === "auth") {
+          // The sign-in is gone: nothing else will sync either. Flag them all
+          // (the sheet says to sign in again); the next sign-in retries them.
+          stoppedEarly = true;
+          this.lastError = "";
+          const blocked = this.items.filter((i) => i.state === "pending");
+          blocked.forEach((i) => {
+            i.state = "attention";
+            i.blocked = "auth";
+            i.error = attentionText(i, result);
+          });
+          this.stop();
+          this.emit();
+          await this.persist();
+          blocked.forEach((i) => {
+            try {
+              this.onSettled(i, "attention", null);
+            } catch (err) {
+              console.error(err);
+            }
+          });
           break;
         }
         this.failures = 0;
         this.lastError = "";
-        const outcome = this.outcomeFor(item, result);
+        const outcome = step.action === "attention" ? "attention" : this.outcomeFor(item, result);
         if (outcome === "attention") {
           item.state = "attention";
+          item.blocked = result.kind === "error" && result.category === "server" ? "server" : "";
           item.error = attentionText(item, result);
         } else {
           this.items = this.items.filter((i) => i.id !== item.id);
@@ -515,6 +564,10 @@ export class CheckinQueue {
       this.inFlight = null;
       this.flushing = false;
       this.emit();
+      if (this.flushAgain) {
+        this.flushAgain = false;
+        if (this.userId === userId && this.pending.length) setTimeout(() => this.flush(), 0);
+      }
     }
     if (!stoppedEarly && !this.pending.length) {
       this.stop();
@@ -544,21 +597,13 @@ export class CheckinQueue {
   }
 }
 
-// What the sheet says about an item the server wouldn't take.
-export function attentionText(item, result) {
-  if (result.kind === "error") {
-    if (result.hint === "checkin_changed") {
-      const at = result.detail ? new Date(result.detail) : null;
-      const when = at && !Number.isNaN(at.getTime()) ? ` at ${at.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : "";
-      return `Checked in again${when}, so the undo wasn't applied`;
-    }
-    if (result.hint === "no_show") return "Marked a no-show: look them up online to let them in";
-    if (item.op === "scan" && isMissingApi(result)) return "This database can't record meal or swag scans yet";
-    return result.message;
-  }
-  const status = result.data?.status;
-  if (status === "unknown" || status === "not_on_roster") return "Not on the roster";
-  return `Unexpected answer: ${JSON.stringify(result.data)}`;
+// Back to waiting, with a fresh count of server errors.
+function reopen(item) {
+  item.state = "pending";
+  item.error = "";
+  item.blocked = "";
+  item.serverFailures = 0;
+  delete item.autoReopened;
 }
 
 export const queue = new CheckinQueue();
